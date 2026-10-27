@@ -180,8 +180,29 @@ export function normalizeFinanceCurrency(value) {
   return DEFAULT_EXCHANGE_RATES[code] ? code : 'CNY'
 }
 
-export function getStoredFinanceCurrency() {
-  return normalizeFinanceCurrency(getLocalStorageItem(FINANCE_CURRENCY_KEY) || 'CNY')
+// 界面语言 → 默认展示货币；仅限 DISPLAY_FINANCE_CURRENCIES，保证货币选择器有对应选项。
+// 账目基准始终是 CNY（服务器价格以 CNY 存储），未知语言回退 CNY。
+const LANGUAGE_FINANCE_CURRENCY_DEFAULTS = Object.freeze({
+  zh: 'CNY',
+  'zh-TW': 'HKD',
+  en: 'USD',
+  ja: 'JPY',
+  id: 'CNY',
+  fr: 'EUR',
+  es: 'EUR'
+})
+
+export function getDefaultFinanceCurrency(language) {
+  const code = String(language || '').trim()
+  const currency = LANGUAGE_FINANCE_CURRENCY_DEFAULTS[code]
+    || LANGUAGE_FINANCE_CURRENCY_DEFAULTS[code.split('-')[0]]
+    || 'CNY'
+  return DISPLAY_FINANCE_CURRENCIES.includes(currency) ? currency : 'CNY'
+}
+
+export function getStoredFinanceCurrency(language) {
+  const stored = getLocalStorageItem(FINANCE_CURRENCY_KEY)
+  return stored ? normalizeFinanceCurrency(stored) : getDefaultFinanceCurrency(language)
 }
 
 export function setStoredFinanceCurrency(currency) {

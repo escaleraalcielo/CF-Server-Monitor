@@ -3,7 +3,7 @@ import { formatBytes, getFlagRegionCode, isServerOnline } from '../utils/api'
 import { getPublicAssetUrl } from '../utils/config'
 import { currentLang, useTranslation } from '../utils/i18n'
 import { LATENCY_WINDOW, PING } from '../utils/constants'
-import { formatBillingPrice } from '../utils/server.js'
+import { formatBillingPrice, resolvePingLabel } from '../utils/server.js'
 
 export const DEFAULT_SERVER_CARD_CONFIG = {
   show_price: true,
@@ -391,7 +391,7 @@ export function useServerCardData(props) {
 
   const buildThreeNetRow = (def) => {
     const customName = props.sysConfig?.[def.nameKey]
-    const label = String(customName || trans.value[def.labelKey] || def.fallbackLabel)
+    const label = resolvePingLabel(customName, trans.value[def.labelKey], def.fallbackLabel)
     const pingSeries = getLatencySeries('ping', def.key)
     const lossSeries = getLatencySeries('loss', def.key)
     const pointCount = Math.max(pingSeries.length, lossSeries.length, getLatencyWindowPointCount())
@@ -446,11 +446,9 @@ export function useServerCardData(props) {
 
   const hasThreeNetDetails = computed(() => threeNetDetails.value.length > 0)
 
+  const resolveCarrierLabel = (def) => resolvePingLabel(props.sysConfig?.[def.nameKey], trans.value[def.labelKey], def.fallbackLabel)
   const pingList = computed(() => [
-    { label: 'CT', value: props.server.ping_ct },
-    { label: 'CU', value: props.server.ping_cu },
-    { label: 'CM', value: props.server.ping_cm },
-    { label: 'BGP', value: props.server.ping_bd },
+    ...THREE_NET_DEFS.slice(0, 4).map(def => ({ label: resolveCarrierLabel(def), value: props.server[def.pingField] })),
     { label: props.server.node_1_name || 'Node 1', value: props.server.ping_node_1 },
     { label: props.server.node_2_name || 'Node 2', value: props.server.ping_node_2 },
     { label: props.server.node_3_name || 'Node 3', value: props.server.ping_node_3 },

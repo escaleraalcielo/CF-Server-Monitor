@@ -2,6 +2,11 @@ export function isDisabledProbeMetric(value) {
   return value === false || value === 'false';
 }
 
+// Ping 节点展示名：优先运营者自定义名，其次当前语言的 locale 文案，最后语言中立的兜底标签。
+export function resolvePingLabel(customName, transLabel, fallbackLabel) {
+  return String(customName || transLabel || fallbackLabel);
+}
+
 export const BILLING_CYCLES = Object.freeze([
   { value: 'month', months: 1, labelZh: '月', labelEn: 'Monthly', shortLabelZh: '月', shortLabelEn: 'M', labelEs: 'Mensual', shortLabelEs: 'mes', labelZhTw: '月', shortLabelZhTw: '月' },
   { value: 'quarter', months: 3, labelZh: '季', labelEn: 'Quarterly', shortLabelZh: '季', shortLabelEn: 'Q', labelEs: 'Trimestral', shortLabelEs: 'trim', labelZhTw: '季', shortLabelZhTw: '季' },

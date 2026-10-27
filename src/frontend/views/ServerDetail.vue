@@ -335,7 +335,7 @@
           <div class="chart-header-actions">
             <div class="ping-indicator">
               <span v-for="item in visiblePingStats" :key="item.field" :class="item.className">
-                {{ item.label }} <b>{{ item.value !== null ? item.value + 'ms' : 'Timeout' }}</b>
+                {{ item.label }} <b>{{ item.value !== null ? item.value + 'ms' : trans.timeout }}</b>
               </span>
             </div>
             <ChartExpandButton :expanded="isChartExpanded('ping')" @toggle="toggleChartExpanded('ping')" />
@@ -813,7 +813,7 @@ const parseLoadAvg = (loadAvgStr) => {
 const isLossValid = (value) => !isDisabledProbeMetric(value) && value !== null && value !== undefined && value !== '' && !Number.isNaN(parseFloat(value))
 const formatLoss = (value) => isLossValid(value) ? `${Math.max(0, Math.min(100, parseFloat(value))).toFixed(0)}%` : ''
 const hasLossData = computed(() => visibleLossFields.value.length > 0)
-const formatPing = (value) => (value === null || value === undefined || value === '' || value === 'null') ? 'Timeout' : `${value}ms`
+const formatPing = (value) => (value === null || value === undefined || value === '' || value === 'null') ? trans.value.timeout : `${value}ms`
 
 const parseBootTimeToMs = (bootTime) => {
   if (!bootTime) return null
