@@ -85,6 +85,29 @@ function timingSafeEqualBytes(left, right) {
   return diff === 0;
 }
 
+/**
+ * 常量时间字符串比较：用于共享密钥（API_SECRET）等机密值的比对，
+ * 避免通过响应时间差异逐字节猜测密钥。
+ * 注意：长度不同的字符串会走不同的摘要长度分支，这里先统一做摘要再比较，
+ * 保证比较耗时与内容无关。
+ * @param {string} left
+ * @param {string} right
+ * @returns {Promise<boolean>}
+ */
+export async function timingSafeEqualString(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') {
+    return false;
+  }
+
+  const encoder = new TextEncoder();
+  const [leftDigest, rightDigest] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(left)),
+    crypto.subtle.digest('SHA-256', encoder.encode(right))
+  ]);
+
+  return timingSafeEqualBytes(new Uint8Array(leftDigest), new Uint8Array(rightDigest));
+}
+
 async function derivePbkdf2Hash(password, salt, iterations) {
   const encoder = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey(

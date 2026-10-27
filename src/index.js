@@ -439,19 +439,8 @@ export default {
           return response;
         }
 
-        if (setTurnstileVerified) {
-          const finalHeaders = new Headers(response.headers);
-          finalHeaders.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '');
-          finalHeaders.set('Access-Control-Allow-Credentials', 'true');
-          finalHeaders.set('Vary', 'Origin');
-
-          return new Response(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: finalHeaders
-          });
-        }
-
+        // Turnstile 通过不代表可以跨域：统一走 CORS 白名单，
+        // 否则任意站点都能拿到带凭证（cfsm_auth Cookie）的响应。
         return applyCors(response, request, corsAllowedOrigins);
       }
     }
@@ -484,6 +473,20 @@ export default {
         debug('[Cron] 开始执行资源负载告警检测');
         await checkResourceAlerts(env, { siteSettings });
         debug('[Cron] 资源负载告警检测完成');
+      }
+
+      // 每小时的合并任务（表轮换、旧表清理、到期检测）。
+      // 账号的 Workers Free 额度只允许 5 个 cron trigger，
+      // 因此小时级任务挂在分钟级 trigger 上，按分钟数自行判定，
+      // 而不是单独注册 '0 * * * *'。
+      if (minute === 0) {
+        if (day === 0 && hour === 0) {
+          debug('[Cron] 开始执行每周数据清理任务（表轮换）');
+          await weeklyCleanup(env.DB);
+          debug('[Cron] 每周数据清理任务完成');
+        }
+        debug('[Cron] 检查是否到达服务器到期检测时间');
+        await checkExpiringServers(env.DB, { scheduled: true, now: now.getTime() });
       }
     } else if (cron === '0 * * * *') {
       if (day === 0 && hour === 0) {

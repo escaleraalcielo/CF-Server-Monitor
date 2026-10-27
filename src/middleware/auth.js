@@ -11,20 +11,45 @@ async function generateKeyFromSecret(secret) {
   return await crypto.subtle.importKey('raw', keyData, ALGORITHM, false, ['sign', 'verify']);
 }
 
+function base64UrlEncode(input) {
+  const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+  let binary = '';
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function base64UrlDecode(input) {
+  const normalized = String(input).replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
 async function signJwt(payload, secret) {
   const header = { alg: 'HS256', typ: 'JWT' };
-  const encodedHeader = btoa(JSON.stringify(header)).replace(/=/g, '');
-  const encodedPayload = btoa(JSON.stringify(payload)).replace(/=/g, '');
-  
+  // 使用 base64url：token 可能出现在 ?token= 查询参数中，
+  // 标准 base64 的 '+' / '/' 会被 URL 解析破坏。
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+
   const data = `${encodedHeader}.${encodedPayload}`;
   const key = await generateKeyFromSecret(secret);
-  
+
   const encoder = new TextEncoder();
   const dataBytes = encoder.encode(data);
   const signature = await crypto.subtle.sign(ALGORITHM, key, dataBytes);
-  
-  const encodedSignature = btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/=/g, '');
-  
+
+  const encodedSignature = base64UrlEncode(new Uint8Array(signature));
+
   return `${encodedHeader}.${encodedPayload}.${encodedSignature}`;
 }
 
@@ -43,15 +68,15 @@ async function verifyJwt(token, secret) {
     const encoder = new TextEncoder();
     const dataBytes = encoder.encode(data);
     
-    const signatureBytes = new Uint8Array(atob(encodedSignature).split('').map(c => c.charCodeAt(0)));
-    
+    const signatureBytes = base64UrlDecode(encodedSignature);
+
     const isValid = await crypto.subtle.verify(ALGORITHM, key, signatureBytes, dataBytes);
-    
+
     if (!isValid) {
       return null;
     }
-    
-    const payload = JSON.parse(atob(encodedPayload));
+
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(encodedPayload)));
     
     if (payload.exp && Date.now() > payload.exp * 1000) {
       return null;
@@ -69,8 +94,14 @@ function getJwtSecret(env, sys) {
     return sys.jwt_secret;
   }
 
-  const fallback = env.API_SECRET || 'default_jwt_secret_for_server_monitor';
-  return fallback.padEnd(32, 'x').substring(0, 64);
+  // 回退到独立的 JWT_SECRET 环境变量（Worker Secret）。
+  // 绝不回退到 API_SECRET：那是所有 Agent 共用的上报密钥，
+  // 任何一台被监控主机泄露它就等于拿到会话签发密钥。
+  if (isValidJwtSecret(env?.JWT_SECRET)) {
+    return env.JWT_SECRET;
+  }
+
+  throw new Error('JWT secret is not configured');
 }
 
 function getCookieValue(request, name) {
@@ -175,13 +206,12 @@ export async function validateCredentials(username, password, env, sys) {
       };
     }
 
-    const valid = (
-      typeof env.API_SECRET === 'string' &&
-      env.API_SECRET.length > 0 &&
-      username === validUsername &&
-      password === env.API_SECRET
-    );
-    return { valid, needsPasswordUpgrade: false };
+    // 未在后台设置独立管理员密码时直接拒绝登录：
+    // API_SECRET 是所有 Agent 共用的上报密钥，写在每台被监控主机的配置文件里，
+    // 拿它当管理员密码意味着任意一台主机泄露即可接管整个面板。
+    // 兼容路径仅保留给显式配置 API_USER_NAME 且设置了独立密码的部署。
+    console.warn('[Auth] 拒绝登录：尚未设置独立的管理员密码');
+    return { valid: false, needsPasswordUpgrade: false };
   } catch (e) {
     console.error('Credential validation error:', e);
     return { valid: false, needsPasswordUpgrade: false };

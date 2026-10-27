@@ -8,6 +8,7 @@ import {
   coerceNumericMetricFields
 } from '../utils/metrics.js';
 import { createErrorResponse, createUnauthorizedResponse, createBadRequestResponse } from '../utils/errors.js';
+import { timingSafeEqualString } from '../utils/common.js';
 import { ensureServerOptimization } from '../database/indexOptimization.js';
 import { getResourceAlertConfig, getWssReportScheduleState, isWssReportConfigured, loadSiteSettings, normalizeBooleanSetting } from '../utils/settings.js';
 import { cacheLatestReportUpdate } from '../utils/latestReportCache.js';
@@ -95,6 +96,42 @@ function getDeclaredContentLength(request) {
   if (!raw) return null;
   const length = Number(raw);
   return Number.isFinite(length) && length >= 0 ? length : null;
+}
+
+/**
+ * 按实际读取字节数限制请求体大小。
+ * 不依赖 Content-Length（chunked 请求可伪造或缺失该头），
+ * 超过上限立即中断读取并返回 null，避免解析超大 body 耗尽 Worker CPU。
+ * @param {Request} request
+ * @param {number} limit 最大字节数
+ * @returns {Promise<string|null>} body 文本；超限返回 null
+ */
+async function readBodyWithLimit(request, limit) {
+  if (!request.body) {
+    return '';
+  }
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let received = 0;
+  let text = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value.byteLength;
+    if (received > limit) {
+      try {
+        await reader.cancel();
+      } catch (_) {
+      }
+      return null;
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+
+  text += decoder.decode();
+  return text;
 }
 
 function createPayloadTooLargeResponse() {
@@ -591,8 +628,17 @@ export async function handleUpdate(request, env, ctx) {
 
 async function handleUpdateCore(request, env, ctx, discovery) {
   try {
+    // 认证前置：优先读取请求头中的密钥，在解析 body 之前完成鉴权，
+    // 避免未认证请求通过超大 body 消耗 Worker CPU。
+    const headerSecret = request.headers.get('X-API-Secret');
+    if (headerSecret !== null) {
+      if (!await timingSafeEqualString(headerSecret, env.API_SECRET)) {
+        return createUnauthorizedResponse('Invalid secret');
+      }
+    }
+
     // 必须在 request.json() 之前：超大 body 的解析本身就可能耗尽 Worker CPU。
-    // 注意这是防呆而非硬上限：chunked 或缺少 Content-Length 的请求会跳过该检查。
+    // Content-Length 只是提示，chunked 请求可以伪造或缺失，因此同时按实际读取字节数硬性截断。
     const declaredLength = getDeclaredContentLength(request);
     if (declaredLength !== null && declaredLength > UPDATE_MAX_REQUEST_BYTES) {
       console.warn('[Update] 413 Payload too large:', {
@@ -602,11 +648,37 @@ async function handleUpdateCore(request, env, ctx, discovery) {
       return createPayloadTooLargeResponse();
     }
 
-    const data = await request.json();
-    const { id: requestedId, secret } = data;
+    let rawBody;
+    try {
+      rawBody = await readBodyWithLimit(request, UPDATE_MAX_REQUEST_BYTES);
+    } catch (e) {
+      if (e && e.code === 'PAYLOAD_TOO_LARGE') {
+        console.warn('[Update] 413 Payload too large (stream):', {
+          limit: UPDATE_MAX_REQUEST_BYTES
+        });
+        return createPayloadTooLargeResponse();
+      }
+      throw e;
+    }
 
-    if (secret !== env.API_SECRET) {
-      return createUnauthorizedResponse('Invalid secret');
+    if (rawBody === null) {
+      return createPayloadTooLargeResponse();
+    }
+
+    let data;
+    try {
+      data = JSON.parse(rawBody);
+    } catch (_) {
+      return createBadRequestResponse('invalidJson');
+    }
+
+    const { id: requestedId, secret } = data || {};
+
+    // 请求头未携带密钥时回退到 body 字段（兼容旧版 Agent）。
+    if (headerSecret === null) {
+      if (!await timingSafeEqualString(secret, env.API_SECRET)) {
+        return createUnauthorizedResponse('Invalid secret');
+      }
     }
 
     let regionCode = request.cf?.country || request.headers?.get('cf-ipcountry') || '';

@@ -1,4 +1,6 @@
-# Cloudflare Workers 配置，线上已由deploy.yml接管，这里仅供本地测试
+# Cloudflare Workers 配置（本地部署入口）
+# 密钥 API_SECRET / JWT_SECRET 通过 `wrangler secret put` 写入为加密 Secret，
+# 绝不放进 [vars]（明文可见）。
 name = "cf-server-monitor"
 main = "src/index.js"
 compatibility_date = "2024-12-01"
@@ -6,12 +8,27 @@ compatibility_flags = ["nodejs_compat"]
 
 keep_vars = true
 
+# 自定义域名：面板只通过 Cloudflare Access（allow-owner）暴露。
+# 同时关闭 workers.dev 直连，避免未经 Access 的入口对外可达
+# （workers.dev 主机名不受本账号的 Access 应用管辖）。
+# 注意：这两项必须是顶层键，不能放进 [vars]，否则会被当成普通环境变量。
+workers_dev = false
+
+routes = [
+  { pattern = "monitor.cachorro-server.stream", custom_domain = true }
+]
+
+[vars]
+# 仅允许面板自身来源跨域访问 API；留空表示同源访问。
+CORS_ALLOWED_ORIGINS = "https://monitor.cachorro-server.stream"
+
 # 定时任务配置（UTC）
 # - 每分钟：执行离线节点、资源告警
-# - 每小时：合并执行其他定时任务（表轮换、旧表清理、按配置时区/小时触发服务器到期检测）
-# - 注意同步修改deploy和index.js scheduled函数里面的值
+# - 每小时（由 index.js 在 minute===0 时判定）：表轮换、旧表清理、服务器到期检测
+# 合并为单个 trigger：Workers Free 账号最多 5 个 cron trigger，
+# 本账号其他 Worker 已占用 4 个。
 [triggers]
-crons = ["*/1 * * * *", "0 * * * *"]
+crons = ["*/1 * * * *"]
 
 [assets]
 directory = "./dist"
@@ -20,6 +37,7 @@ binding = "ASSETS"
 [[d1_databases]]
 binding = "DB"
 database_name = "server-monitor-db"
+database_id = "8ecb1f63-bdd4-4d74-9d3c-75e0dee5ee38"
 
 # Durable Objects：实时指标广播中心
 # 注意：首次部署前需要执行 `wrangler durable-object create MetricsBroadcaster --class MetricsBroadcaster`
