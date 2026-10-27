@@ -15,7 +15,7 @@
 import { saveMetricsHistory } from '../database/schema.js';
 import { evaluateTrafficAlert } from '../services/notification.js';
 import { ensureServerOptimization } from '../database/indexOptimization.js';
-import { getServerDetail, clearServerDetailCache, clearLatestMetricsCache } from '../utils/cache.js';
+import { getServerDetail, clearServerDetailCache } from '../utils/cache.js';
 import { getWssReportScheduleState, loadSiteSettings } from '../utils/settings.js';
 import {
   AGENT_CONFIG_MD5_HEADER,
@@ -1285,9 +1285,6 @@ export class MetricsBroadcaster {
         payload.timestamp,
         payload.agentVersion
       );
-      // 刚写入的新指标必须立即可见：latestAllCache 是 30 秒的 isolate 缓存，
-      // 不失效的话新上线的服务器在这段时间内会被当成没有数据而显示为离线。
-      clearLatestMetricsCache();
       // 月流量阈值告警：写入成功后台非阻塞执行（waitUntil），不阻塞 WebSocket 消息循环
       if (typeof this.state?.waitUntil === 'function') {
         this.state.waitUntil((async () => {

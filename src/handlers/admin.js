@@ -1,6 +1,6 @@
 import { buildAuthCookie, buildClearAuthCookie, checkAuth, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
 import { getLatestMetricsForAllServers } from '../database/schema.js';
-import { getAllServers, clearServersListCache } from '../utils/cache.js';
+import { getAllServers, clearServersListCache, clearLatestMetricsCache } from '../utils/cache.js';
 import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
 import { normalizePctOrNull } from '../utils/traffic.js';
@@ -595,9 +595,12 @@ async function handleSaveThemeOptionsAction({ env, sys, data }) {
 }
 
 async function handleListAction({ env, data }) {
-  // 管理后台「刷新缓存」会带 refresh: true，跳过本 isolate 的 120 秒列表缓存直接读 D1
+  // 管理后台「刷新缓存」会带 refresh: true，跳过本 isolate 的 120 秒列表缓存直接读 D1。
+  // 最新指标快照是另一份独立的 30 秒缓存，不一起清掉的话，刷新后看到的仍是旧指标，
+  // 「刚上线的主机仍显示离线」的现象就会一直存在。
   if (data?.refresh === true) {
     clearServersListCache();
+    clearLatestMetricsCache();
   }
 
   const servers = await getAllServers(env.DB);

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { handleUpdate } from '../src/handlers/update.js';
+import { handleAdminAPI } from '../src/handlers/admin.js';
+import { generateToken } from '../src/middleware/auth.js';
 import {
   clearAllCaches,
   getLatestMetricsCache,
@@ -118,3 +120,39 @@ test('a report with an invalid secret does not clear the cache', async () => {
 
   clearAllCaches();
 });
+
+test('the admin list refresh clears the cached latest-metrics snapshot', async () => {
+  clearAllCaches();
+
+  const stale = new Map();
+  setLatestMetricsCache(stale);
+
+  const env = createEnv();
+  const sys = { username: 'admin', password: '', jwt_secret: 'b'.repeat(48) };
+  const token = await generateToken(env, sys);
+
+  const response = await handleAdminAPI(
+    new Request('https://example.com/admin/api', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ action: 'list', refresh: true })
+    }),
+    env,
+    sys,
+    null,
+    { waitUntil() {} }
+  );
+
+  assert.equal(response.status, 200);
+  // "Refresh cache" in the admin panel has to drop the metrics snapshot too,
+  // otherwise the refreshed list still shows the previous metrics.
+  // The list repopulates the cache with fresh data, so the stale snapshot
+  // object must no longer be the cached one.
+  assert.notEqual(getLatestMetricsCache().cache, stale);
+
+  clearAllCaches();
+});
+
