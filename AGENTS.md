@@ -140,10 +140,45 @@ All four run the agent as a **non-root** systemd user unit, config mode 0600,
 | gondor | `gondor` | root → `cfsm` | `08439a19-f66f-40d7-883a-645a270d9cf0` | `/home/cfsm/.cf-probe/` |
 
 - Status: `systemctl --user status cf-probe` · Logs: `journalctl --user -u cf-probe -f`
-- `gondor` runs as a dedicated `cfsm` system user (not root); its user unit must be
-  enabled as that user: `sudo -u cfsm -H XDG_RUNTIME_DIR=/run/user/993 systemctl --user enable cf-probe.service`.
-  Without `XDG_RUNTIME_DIR` the enable silently no-ops and the service does not
-  start on boot.
+- `gondor` runs as a dedicated `cfsm` system user (not root).
+
+### Inspecting a user systemd unit over SSH
+
+`systemctl --user` always talks to **the calling user's** user manager. Running it as
+root inspects root's manager, so another user's unit looks missing even when it is
+healthy. Always run it as the service owner with that user's runtime dir:
+
+```bash
+# on the target host, as root
+runuser -u cfsm -- env XDG_RUNTIME_DIR=/run/user/$(id -u cfsm) \
+  systemctl --user is-enabled cf-probe.service
+runuser -u cfsm -- env XDG_RUNTIME_DIR=/run/user/$(id -u cfsm) \
+  journalctl --user -u cf-probe --no-pager -n 20
+```
+
+### The installer can leave a unit present but not enabled
+
+When the installer runs under `sudo -u`/`runuser` without `XDG_RUNTIME_DIR`, it writes
+the unit file but the `systemctl --user enable` step silently no-ops. The unit exists,
+the agent runs, and it still dies on reboot. After every install check both:
+
+```bash
+systemctl --user is-enabled cf-probe.service          # must print "enabled"
+ls -l ~/.config/systemd/user/default.target.wants/cf-probe.service   # symlink must exist
+```
+
+`is-active` alone is not enough — it says nothing about boot persistence.
+
+### Verifying the agent binary
+
+Fetch the pinned release and its `checksums.txt`, verify, then run. A single `sed`
+strips the `dist/` prefix; do **not** substitute the filename a second time or the
+line is corrupted and verification fails:
+
+```bash
+grep 'dist/cf-probe-linux-amd64$' checksums.txt | sed 's|dist/||' | sha256sum -c -
+# -> cf-probe-linux-amd64: OK
+```
 
 ---
 
