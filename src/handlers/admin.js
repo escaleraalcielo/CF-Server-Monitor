@@ -1,7 +1,7 @@
 import { buildAuthCookie, buildClearAuthCookie, checkAuth, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
 import { getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, clearServersListCache } from '../utils/cache.js';
-import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, loadSiteSettings, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
+import { clearAppearanceSettingsCache, clearSiteSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, loadSiteSettings, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
 import { normalizePctOrNull } from '../utils/traffic.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
@@ -557,7 +557,14 @@ export function sanitizeAdminSettings(fullSettings = {}) {
   };
 }
 
-async function handleGetSettingsAction({ env, sys, loadFullSettings }) {
+async function handleGetSettingsAction({ env, sys, loadFullSettings, data }) {
+  // 站点设置与外观选项都按 isolate 缓存 120 秒。保存设置后紧接着重新拉取时，
+  // 其它 isolate 的缓存里可能还是旧值（刚改的用户名、刚设的密码会被退回）。
+  // refresh: true 时先清掉这两份缓存，再直接读 D1。
+  if (data?.refresh === true) {
+    clearSiteSettingsCache();
+    clearAppearanceSettingsCache();
+  }
   const fullSettings = loadFullSettings ? await loadFullSettings() : sys;
   return createSuccessResponse({
     success: true,
