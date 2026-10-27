@@ -155,7 +155,11 @@ test('minute cron shares one settings read, preserves refresh cadence and adds n
   assert.deepEqual(db.stats, { settings: 1, legacy: 0, servers: 1, history: 1, batches: 1, offline: 1, resource: 1, writes: 0 });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].resultFormat, RESOURCE_ALERT_COMPACT_RESULT_FORMAT);
-  assert.deepEqual(storage, { reads: 1, writes: 0 });
+  // The activation time of the resource alert sampling window is persisted so
+  // that it survives the Durable Object going to sleep between two reports.
+  // Without it the window resets on every wake-up and alert samples are never
+  // collected again, so this one write is required for alerting to work.
+  assert.deepEqual(storage, { reads: 1, writes: 1 });
 
   t.mock.timers.tick(MINUTE);
   db.timestamps.set('server-1', Date.now());
@@ -366,7 +370,10 @@ for (const mode of ['average', 'continuous']) {
       assert.equal(db.stats.settings, 0);
       assert.equal(db.stats.resource, 12);
       assert.equal(calls.length, 12);
-      assert.equal(storage.writes, 0);
+      // One persist per tick: the activation time of the resource alert
+      // sampling window is stored so that it survives the Durable Object
+      // going to sleep between two reports.
+      assert.equal(storage.writes, 12);
       runs.push({ snapshots, messages: structuredClone(messages), stats: db.stats });
     }
     assert.deepEqual(runs[0], runs[1], 'formats must produce identical persisted state, notifications and D1 work');

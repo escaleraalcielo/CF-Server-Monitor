@@ -10,7 +10,12 @@
 //
 // - 前端订阅连接使用 DO WebSocket Hibernation API，闲置时休眠以节省资源。
 //   通过 setWebSocketAutoResponse 自动响应 ping，无需唤醒 DO。
-// - Agent 上报连接使用标准 WebSocket API，避免高频指标消息计为 hibernation wakeup。
+// - Agent 上报连接同样使用 Hibernation API：标准 WebSocket API 会让 DO 在
+//   Agent 保持长连接期间一直驻留，按 128 MB/秒 持续产生 duration 费用。
+//   改用 Hibernation API 后 DO 可以在两次上报之间休眠；代价是每条上行消息
+//   都会唤醒 DO，按 Cloudflare 的 20:1 口径计入请求数。
+// - 因此凡是需要在两次上报之间保留的状态，都必须放在 socket attachment
+//   或 DO 存储里，不能只放在实例字段上。
 
 import { saveMetricsHistory } from '../database/schema.js';
 import { evaluateTrafficAlert } from '../services/notification.js';
@@ -63,6 +68,25 @@ const AGENT_WSS_SCHEDULE_INACTIVE = 'wss_schedule_inactive';
 const AGENT_WSS_SCHEDULE_DISABLED = 'wss_disabled';
 const ALLOWED_AGENT_REPORT_INTERVALS = new Set([30, 60, 120, 180]);
 const RESOURCE_ALERT_STORAGE_KEY = 'resource_alert_windows_v1';
+// 资源告警采样窗口的“激活到期时间”单独存放：DO 休眠后实例字段会丢失，
+// 而告警采样依赖这个窗口，没有它就再也不会积累到足够样本。
+const RESOURCE_ALERT_CACHE_STATE_KEY = 'resource_alert_cache_state_v1';
+// 每台服务器上一次写入 D1 的时间，单独持久化：
+// Agent 重连（尤其在 DO 休眠后重连）时新的 attachment 不带这个值，
+// 没有它就会在重连后立刻多写一行历史。
+const AGENT_HISTORY_WRITE_STATE_KEY = 'agent_history_write_state_v1';
+
+// 比较两个 attachment 的内容是否一致（只看自身可枚举的顶层字段）。
+function isSameAttachment(a, b) {
+  if (!a || !b) return false;
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  for (const key of keysA) {
+    if (a[key] !== b[key]) return false;
+  }
+  return true;
+}
 const RESOURCE_ALERT_BUCKET_MS = 60 * 1000;
 const RESOURCE_ALERT_MAX_BUCKETS = 10;
 const RESOURCE_ALERT_MAX_SERVERS = 1000;
@@ -286,10 +310,10 @@ export class MetricsBroadcaster {
     this.resourceAlertSnapshotDirty = false;
     this.resourceAlertLastSnapshotSave = 0;
     this.resourceAlertCacheActiveUntil = 0;
+    this.resourceAlertCacheStateLoaded = false;
     this.agentServerDetails = new Map();
     this.agentHistoryWrites = new Map();
-    this.standardAgentWebSocketCount = 0;
-    this.standardAgentWebSockets = new Set();
+    this.agentHistoryWriteState = null;
     this.lastAgentRealtimeHintAt = 0;
     this.pendingFrontendBroadcasts = new Map();
     this.frontendBroadcastTimer = null;
@@ -449,14 +473,12 @@ export class MetricsBroadcaster {
   }
 
   _getAgentReportWebSockets() {
-    const sockets = new Set(this.standardAgentWebSockets);
-    for (const ws of this.state.getWebSockets()) {
+    // Agent 上报连接都通过 acceptWebSocket 接入，休眠后依然保留在 state 里，
+    // 因此这里就是全部 Agent 连接，不需要额外的内存登记表。
+    return this.state.getWebSockets().filter(ws => {
       const attachment = ws.deserializeAttachment();
-      if (attachment?.kind === AGENT_REPORT_KIND) {
-        sockets.add(ws);
-      }
-    }
-    return Array.from(sockets);
+      return attachment?.kind === AGENT_REPORT_KIND;
+    });
   }
 
   _isWebSocketUpgrade(request) {
@@ -470,44 +492,23 @@ export class MetricsBroadcaster {
     } catch (_) {}
   }
 
-  _acceptStandardAgentWebSocket(server, initialAttachment) {
-    // Agent 上报连接使用标准 WebSocket API，避免每条业务消息都成为 hibernation wakeup。
-    // 代价是只要 Agent 长连接存在，本 DO 就不能休眠，会持续产生 duration。
-    server.accept();
+  _acceptAgentReportWebSocket(server, initialAttachment) {
+    // Agent 上报连接使用 WebSocket Hibernation API。
+    //
+    // 标准 WebSocket API（server.accept()）会让 DO 在 Agent 保持长连接期间一直驻留，
+    // 按 128 MB/秒 持续产生 duration 费用；Hibernation API 允许 DO 在没有消息时休眠，
+    // 唤醒时由运行时重新执行构造函数。
+    //
+    // 代价是每条上行消息都会唤醒 DO，按 Cloudflare 的 20:1 口径计入请求数：
+    // 4 台服务器每分钟一条上报约为 288 个计费请求/天，远低于常驻的 duration 费用。
+    //
+    // 另有一处收益：构造函数里配置的 setWebSocketAutoResponse 只会作用于
+    // 通过 acceptWebSocket 接入的连接，因此 Agent 的 ping 心跳现在由运行时直接应答，
+    // 不再唤醒 DO。
+    this.state.acceptWebSocket(server);
+    server.serializeAttachment(initialAttachment || {});
 
-    const session = { attachment: initialAttachment || {} };
-    const ws = {
-      send: data => server.send(data),
-      close: (code, reason) => server.close(code, reason),
-      serializeAttachment(value) {
-        session.attachment = value || {};
-      },
-      deserializeAttachment() {
-        return session.attachment;
-      }
-    };
-
-    this.standardAgentWebSocketCount += 1;
-    this.standardAgentWebSockets.add(ws);
-    let cleaned = false;
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      this.standardAgentWebSocketCount = Math.max(0, this.standardAgentWebSocketCount - 1);
-      this.standardAgentWebSockets.delete(ws);
-    };
-
-    server.addEventListener('message', event => {
-      this._handleAgentReportMessage(ws, event.data, ws.deserializeAttachment())
-        .catch(error => {
-          console.warn('[update-ws] Agent standard WebSocket message failed:', error?.message || error);
-          this._closeWsWithError(ws, 'Internal error', 500);
-        });
-    });
-    server.addEventListener('close', cleanup);
-    server.addEventListener('error', cleanup);
-
-    return ws;
+    return server;
   }
 
   _closeWsWithError(ws, message, code = 400, extra = {}, closeCode = WS_POLICY_VIOLATION, closeReason = message) {
@@ -727,6 +728,11 @@ export class MetricsBroadcaster {
       this.agentServerDetails.delete(serverId);
       this.agentHistoryWrites.delete(serverId);
       this.latestReportUpdates.delete(serverId);
+      // 持久化的写入时间也要一并清掉，否则服务器反复增删会让它无限增长。
+      if (this.agentHistoryWriteState && serverId in this.agentHistoryWriteState) {
+        delete this.agentHistoryWriteState[serverId];
+        this._persistAgentHistoryWriteState(this.agentHistoryWriteState);
+      }
       this._closeWsWithError(ws, 'Server not found', 404, { text: 'server_not_found' });
       return null;
     }
@@ -779,7 +785,11 @@ export class MetricsBroadcaster {
       configSchema: agentConfig.schema,
       configMd5: agentConfig.md5
     };
-    ws.serializeAttachment(nextAttachment);
+    // 内容没有变化就不重写 attachment：每次写入都是一次存储操作，
+    // 高频上报时没必要反复写同样的内容。
+    if (!isSameAttachment(attachment, nextAttachment)) {
+      ws.serializeAttachment(nextAttachment);
+    }
 
     return {
       attachment: nextAttachment,
@@ -1064,8 +1074,9 @@ export class MetricsBroadcaster {
 
   async _ingestRealtimeUpdates(normalizedUpdates, reportTs = Date.now(), options = {}) {
     if (!Array.isArray(normalizedUpdates) || normalizedUpdates.length === 0) return;
+    // 先加载快照：加载过程会恢复休眠后丢失的采样窗口，之后再判断是否采样。
+    await this._ensureResourceAlertSnapshotLoaded();
     if (this._shouldCacheResourceAlertSamples(reportTs)) {
-      await this._ensureResourceAlertSnapshotLoaded();
       await this._cacheResourceAlertSamples(normalizedUpdates, reportTs);
     }
     this._cacheLatestReportUpdates(normalizedUpdates, reportTs);
@@ -1110,16 +1121,41 @@ export class MetricsBroadcaster {
     );
     if (this.frontendBroadcastTimer !== null) return;
 
+    let resolveFlush;
+    const flushed = new Promise(resolve => { resolveFlush = resolve; });
+    this.frontendBroadcastFlushResolve = resolveFlush;
     this.frontendBroadcastTimer = setTimeout(() => {
       this.frontendBroadcastTimer = null;
-      this._flushFrontendBroadcastBatch();
+      try {
+        this._flushFrontendBroadcastBatch();
+      } finally {
+        if (typeof this.frontendBroadcastFlushResolve === 'function') {
+          const resolve = this.frontendBroadcastFlushResolve;
+          this.frontendBroadcastFlushResolve = null;
+          resolve();
+        }
+      }
     }, AGENT_WSS_FRONTEND_BATCH_WINDOW_MS);
+
+    // setTimeout 属于易失状态：DO 在事件处理结束、且没有其它待处理事件时可能立刻休眠，
+    // 队列里的样本就丢了。用 waitUntil 把这次延迟刷新挂到当前事件的生命周期上，
+    // 休眠会等到刷新完成为止。
+    if (typeof this.state?.waitUntil === 'function') {
+      this.state.waitUntil(flushed);
+    }
   }
 
   _flushFrontendBroadcastBatch() {
     if (this.frontendBroadcastTimer !== null) {
       clearTimeout(this.frontendBroadcastTimer);
       this.frontendBroadcastTimer = null;
+    }
+    // 直接刷新时也要兑现 waitUntil 的 promise：未兑现的 promise 会让 DO
+    // 在最长 15 分钟内无法被回收。
+    if (typeof this.frontendBroadcastFlushResolve === 'function') {
+      const resolve = this.frontendBroadcastFlushResolve;
+      this.frontendBroadcastFlushResolve = null;
+      resolve();
     }
     if (this.pendingFrontendBroadcasts.size === 0) {
       this.pendingFrontendBroadcastTs = 0;
@@ -1232,6 +1268,47 @@ export class MetricsBroadcaster {
     return hinted;
   }
 
+  async _loadAgentHistoryWriteState() {
+    if (this.agentHistoryWriteState) return this.agentHistoryWriteState;
+    try {
+      const stored = await this.state.storage.get(AGENT_HISTORY_WRITE_STATE_KEY);
+      this.agentHistoryWriteState = (stored && typeof stored === 'object') ? stored : {};
+    } catch (e) {
+      console.warn('[update-ws] load history write state failed:', e.message || e);
+      this.agentHistoryWriteState = {};
+    }
+    return this.agentHistoryWriteState;
+  }
+
+  _persistAgentHistoryWriteState(writeState) {
+    if (!writeState || typeof writeState !== 'object') return;
+    let write;
+    try {
+      write = this.state.storage.put(AGENT_HISTORY_WRITE_STATE_KEY, writeState);
+    } catch (e) {
+      console.warn('[update-ws] persist history write state failed:', e.message || e);
+      return;
+    }
+    const settled = Promise.resolve(write).catch(e => {
+      console.warn('[update-ws] persist history write state failed:', e.message || e);
+    });
+    if (typeof this.state?.waitUntil === 'function') {
+      this.state.waitUntil(settled);
+    }
+  }
+
+  _saveAgentPendingAggregate(ws, attachment, pendingAggregate) {
+    // 待写入的聚合值写回 socket attachment，保证 DO 休眠后仍能取回。
+    try {
+      if (!ws || typeof ws.serializeAttachment !== 'function') return;
+      const current = ws.deserializeAttachment() || attachment || {};
+      ws.serializeAttachment({
+        ...current,
+        pendingHistoryAggregate: pendingAggregate || null
+      });
+    } catch (_) {}
+  }
+
   async _persistAgentHistoryIfDue(ws, attachment, payload) {
     const serverId = String(payload.serverId || '');
     const now = Date.now();
@@ -1239,17 +1316,22 @@ export class MetricsBroadcaster {
     const currentAggregate = payload.historyAggregate ||
       collectHistoryMetricAggregates([{ metrics: payload.metrics }]);
 
+    // 待写入的聚合值同时保存在 socket attachment 上：DO 休眠后实例字段会丢失，
+    // 只有 attachment 与 DO 存储能跨休眠保留，否则这段窗口内的采样会丢失。
+    const pendingAggregate = state.pendingHistoryAggregate || attachment.pendingHistoryAggregate;
+
     if (state.flushing) {
       state.pendingHistoryAggregate = mergeHistoryMetricAggregates(
-        state.pendingHistoryAggregate,
+        pendingAggregate,
         currentAggregate
       );
       this.agentHistoryWrites.set(serverId, state);
+      this._saveAgentPendingAggregate(ws, attachment, state.pendingHistoryAggregate);
       return { persisted: false, nextD1WriteAfterMs: 0 };
     }
 
     state.pendingHistoryAggregate = mergeHistoryMetricAggregates(
-      state.pendingHistoryAggregate,
+      pendingAggregate,
       currentAggregate
     );
     const intervalMs = Math.max(
@@ -1260,13 +1342,17 @@ export class MetricsBroadcaster {
     );
     const lastWriteTs = Math.max(
       Number(state.lastD1WriteTs) || 0,
-      Number(attachment.lastD1WriteTs) || 0
+      Number(attachment.lastD1WriteTs) || 0,
+      Number((this.agentHistoryWriteState || {})[serverId]) || 0
     );
     const nextWriteTs = lastWriteTs + intervalMs;
 
     if (lastWriteTs > 0 && now < nextWriteTs) {
       state.lastD1WriteTs = lastWriteTs;
       this.agentHistoryWrites.set(serverId, state);
+      // 这次采样要等到下一个写入周期才落盘，因此把待写入的聚合值存到
+      // attachment 上；走写入路径时不需要，因为写入成功后会一并清空。
+      this._saveAgentPendingAggregate(ws, attachment, state.pendingHistoryAggregate);
       return { persisted: false, nextD1WriteAfterMs: nextWriteTs - now };
     }
 
@@ -1307,8 +1393,15 @@ export class MetricsBroadcaster {
       const currentAttachment = ws.deserializeAttachment() || attachment;
       ws.serializeAttachment({
         ...currentAttachment,
-        lastD1WriteTs: persistedAt
+        lastD1WriteTs: persistedAt,
+        // 已写入，待写入的聚合值清空，避免休眠后重复写入。
+        pendingHistoryAggregate: null
       });
+      // 同时持久化到 DO 存储：Agent 重连后新的 attachment 不带这个值，
+      // 没有它就会在重连后立刻多写一行历史。
+      const writeState = await this._loadAgentHistoryWriteState();
+      writeState[serverId] = persistedAt;
+      this._persistAgentHistoryWriteState(writeState);
       return {
         persisted: true,
         nextD1WriteAfterMs: intervalMs
@@ -1318,6 +1411,7 @@ export class MetricsBroadcaster {
         aggregateForWrite,
         state.pendingHistoryAggregate
       );
+      this._saveAgentPendingAggregate(ws, attachment, state.pendingHistoryAggregate);
       throw e;
     } finally {
       state.flushing = false;
@@ -1408,6 +1502,18 @@ export class MetricsBroadcaster {
       serverId: context.serverId,
       samples: broadcastSamples
     }];
+    // 先加载快照：加载过程会恢复休眠后丢失的采样窗口。
+    // 必须在 _getAgentRealtimeState 之前，否则唤醒后的第一条上报会因为
+    // 窗口“未激活”而走进 else 分支，告警采样永远积累不起来。
+    await this._ensureResourceAlertSnapshotLoaded();
+    // 同样先加载“每台服务器上次写入 D1 的时间”：Agent 重连后新的 attachment
+    // 不带这个值，没有它就会在重连后立刻多写一行历史。
+    await this._loadAgentHistoryWriteState();
+    // 采样窗口的激活时间在实例字段里，DO 休眠后会丢失；
+    // 窗口看起来是关闭的，就从存储里恢复一次。
+    if (!this._shouldCacheResourceAlertSamples(reportTs)) {
+      await this._restoreResourceAlertCacheState();
+    }
     const realtimeState = this._getAgentRealtimeState(reportTs);
     if (realtimeState.realtimeActive) {
       await this._ingestRealtimeUpdates(normalizedUpdates, reportTs, { batchFrontend: true });
@@ -1465,7 +1571,7 @@ export class MetricsBroadcaster {
     nextHour.setUTCMinutes(60, 0, 0);
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    const agentSocket = this._acceptStandardAgentWebSocket(server, {
+    const agentSocket = this._acceptAgentReportWebSocket(server, {
       kind: AGENT_REPORT_KIND,
       authenticated: false,
       serverId: '',
@@ -1607,8 +1713,9 @@ export class MetricsBroadcaster {
           headers: { 'Content-Type': 'application/json' }
         });
       }
+      // 先加载快照以恢复休眠后丢失的采样窗口，再判断是否采样。
+      await this._ensureResourceAlertSnapshotLoaded();
       if (this._shouldCacheResourceAlertSamples(reportTs)) {
-        await this._ensureResourceAlertSnapshotLoaded();
         await this._cacheResourceAlertSamples([{
           serverId,
           samples: [{ ts: reportTs, data: payload }]
@@ -1745,8 +1852,8 @@ export class MetricsBroadcaster {
     // ── 3) 健康检查 ────────────────────────────────────
     if (method === 'GET' && (path === '/health' || path.endsWith('/health'))) {
       const subscribers = this._getFrontendSubscriberCount();
-      const agentSockets = this.standardAgentWebSocketCount;
-      const sockets = this.state.getWebSockets().length + agentSockets;
+      const agentSockets = this._getAgentReportWebSockets().length;
+      const sockets = this.state.getWebSockets().length;
       return new Response(JSON.stringify({ ok: true, subscribers, sockets, agentSockets }), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -1817,6 +1924,42 @@ export class MetricsBroadcaster {
       this.resourceAlertCacheActiveUntil,
       now + RESOURCE_ALERT_CACHE_ACTIVE_GRACE_MS
     );
+    // 激活时间必须落在持久化状态上：DO 在两次事件之间会休眠，实例字段随之清零，
+    // 而采样窗口的判断依赖它。定时任务每分钟激活一次，因此这里每分钟写一次。
+    this._persistResourceAlertCacheState(this.resourceAlertCacheActiveUntil);
+  }
+
+  _persistResourceAlertCacheState(activeUntil) {
+    let write;
+    try {
+      write = this.state.storage.put(RESOURCE_ALERT_CACHE_STATE_KEY, { activeUntil });
+    } catch (e) {
+      console.warn('[resource-alert] persist cache state failed:', e.message || e);
+      return;
+    }
+    const settled = Promise.resolve(write).catch(e => {
+      console.warn('[resource-alert] persist cache state failed:', e.message || e);
+    });
+    if (typeof this.state?.waitUntil === 'function') {
+      this.state.waitUntil(settled);
+    }
+  }
+
+  // 读取并恢复采样窗口的激活到期时间。DO 休眠后实例字段会被清空，
+  // 没有它，唤醒后的上报会因为窗口“未激活”而跳过告警采样。
+  // 只在 Agent 上报路径上调用：定时任务路径不需要额外读写。
+  async _restoreResourceAlertCacheState() {
+    if (this.resourceAlertCacheStateLoaded) return;
+    this.resourceAlertCacheStateLoaded = true;
+    try {
+      const cacheState = await this.state.storage.get(RESOURCE_ALERT_CACHE_STATE_KEY);
+      const storedUntil = Number(cacheState?.activeUntil) || 0;
+      if (storedUntil > this.resourceAlertCacheActiveUntil) {
+        this.resourceAlertCacheActiveUntil = storedUntil;
+      }
+    } catch (e) {
+      console.warn('[resource-alert] load cache state failed:', e.message || e);
+    }
   }
 
   _shouldCacheResourceAlertSamples(now = Date.now()) {
@@ -1910,7 +2053,14 @@ export class MetricsBroadcaster {
       }
     }
 
-    await this._persistResourceAlertSnapshotIfNeeded(now);
+    await this._persistResourceAlertSnapshotIfNeeded(now, this._mustFlushResourceAlertSnapshot());
+  }
+
+  // 没有前端订阅时，DO 会在两次上报之间休眠，内存里的采样会随之清空；
+  // 这时必须立刻落盘，否则错开时间上报的服务器会丢掉各自的采样。
+  // 有订阅时上报更密集、DO 不会休眠，60 秒的节流就够了。
+  _mustFlushResourceAlertSnapshot() {
+    return this._getFrontendSubscriberCount() === 0;
   }
 
   async _persistResourceAlertSnapshotIfNeeded(now = Date.now(), force = false) {
