@@ -184,10 +184,10 @@ export function normalizeFinanceCurrency(value) {
 // converted for display), so CNY stays the fallback for anything unknown.
 const LANGUAGE_CURRENCY = Object.freeze({
   zh: 'CNY',
-  'zh-TW': 'TWD',
+  'zh-TW': 'HKD',
   en: 'USD',
   ja: 'JPY',
-  id: 'IDR',
+  id: 'USD',
   fr: 'EUR',
   es: 'EUR'
 })
@@ -195,13 +195,19 @@ const LANGUAGE_CURRENCY = Object.freeze({
 /**
  * The currency to display when the user has not chosen one.
  * Uses the active UI language, so an English UI shows USD rather than CNY.
+ * The result is constrained to DISPLAY_FINANCE_CURRENCIES, which is the set
+ * the currency picker offers — a value outside it would leave the <select>
+ * with no matching option selected.
  * @param {string} languageCode active UI language code
  * @returns {string} currency code
  */
 export function getDefaultFinanceCurrency(languageCode) {
   const code = String(languageCode || '').trim()
   const mapped = LANGUAGE_CURRENCY[code]
-  return mapped && DEFAULT_EXCHANGE_RATES[mapped] ? mapped : 'CNY'
+  if (!mapped) return 'CNY'
+  if (DISPLAY_FINANCE_CURRENCIES.includes(mapped)) return mapped
+  const fallback = DEFAULT_EXCHANGE_RATES[mapped] ? mapped : 'CNY'
+  return DISPLAY_FINANCE_CURRENCIES.includes(fallback) ? fallback : 'CNY'
 }
 
 export function getStoredFinanceCurrency(languageCode) {

@@ -1456,7 +1456,7 @@ const loadSettings = async () => {
         custom_cu_name: settingsData.custom_cu_name || '',
         custom_cm_name: settingsData.custom_cm_name || '',
         custom_bd_name: settingsData.custom_bd_name || '',
-        node_1_name: settingsData.node_1_name || '', node_2_name: settingsData.node_2_name || '', node_3_name: settingsData.node_3_name || '', node_4_name: settingsData.node_4_name || '',
+        node_1_name: settingsData.node_1_name || 'Node 1', node_2_name: settingsData.node_2_name || 'Node 2', node_3_name: settingsData.node_3_name || 'Node 3', node_4_name: settingsData.node_4_name || 'Node 4',
         theme_url: settingsData.theme_url || '',
         csp_static: settingsData.csp_static || '',
         csp_api: settingsData.csp_api || ''
