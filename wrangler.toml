@@ -11,7 +11,10 @@ keep_vars = true
 # - 每小时：合并执行其他定时任务（表轮换、旧表清理、按配置时区/小时触发服务器到期检测）
 # - 注意同步修改deploy和index.js scheduled函数里面的值
 [triggers]
-crons = ["*/1 * * * *", "0 * * * *"]
+# 每分钟：执行离线节点、资源告警
+# 每小时（由 index.js 在 minute===0 时判定）：表轮换、旧表清理、服务器到期检测
+# 合并为单个 trigger：Workers Free 账号的 cron trigger 数量有限。
+crons = ["*/1 * * * *"]
 
 [assets]
 directory = "./dist"

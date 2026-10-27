@@ -474,6 +474,19 @@ export default {
         await checkResourceAlerts(env, { siteSettings });
         debug('[Cron] 资源负载告警检测完成');
       }
+
+      // 每小时的合并任务（表轮换、旧表清理、到期检测）。
+      // Workers Free 账号的 cron trigger 数量有限，因此小时级任务挂在分钟级
+      // trigger 上，按分钟数自行判定，而不是单独注册 '0 * * * *'。
+      if (minute === 0) {
+        if (day === 0 && hour === 0) {
+          debug('[Cron] 开始执行每周数据清理任务（表轮换）');
+          await weeklyCleanup(env.DB);
+          debug('[Cron] 每周数据清理任务完成');
+        }
+        debug('[Cron] 检查是否到达服务器到期检测时间');
+        await checkExpiringServers(env.DB, { scheduled: true, now: now.getTime() });
+      }
     } else if (cron === '0 * * * *') {
       if (day === 0 && hour === 0) {
         debug('[Cron] 开始执行每周数据清理任务（表轮换）');
