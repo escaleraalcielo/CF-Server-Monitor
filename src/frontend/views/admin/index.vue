@@ -928,7 +928,7 @@ const syncApiIndexQuery = () => {
 const adminApiForSite = (data) => adminApi(data, selectedApiIndex.value)
 
 const isLoggedIn = ref(false)
-const loginForm = ref({ username: '', password: '' })
+const loginForm = ref({ username: 'admin', password: '' })
 const loginError = ref('')
 const loginLoading = ref(false)
 const adminSiteLoading = ref(false)
@@ -1654,7 +1654,8 @@ const saveSettings = async () => {
     }
   }
 
-  if (shouldChangePassword && settings.value.password.length > 0) {
+  const passwordWasSubmitted = shouldChangePassword && settings.value.password.length > 0
+  if (passwordWasSubmitted) {
     data.settings.password = settings.value.password
   }
 
@@ -1670,6 +1671,11 @@ const saveSettings = async () => {
       clearAdminPasswordInputs()
       changeAdminPassword.value = false
       settings.value.jwt_secret = ''
+      // 密码已保存：立即标记为已配置，避免随后的保存（例如切换主题）仍按旧状态
+      // 提示“请先设置密码”。loadSettings() 读到的可能是其它 isolate 的旧缓存。
+      if (passwordWasSubmitted) {
+        settings.value.password_configured = true
+      }
       loadSettings()
     } else {
       saveResult.value = { success: false, error: getMessage(result.error) || 'fail' }

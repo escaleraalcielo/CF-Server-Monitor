@@ -722,7 +722,7 @@
                 data-form-type="other"
                 v-model="settings.password"
                 class="form-input"
-                :placeholder="settings.password_configured ? '••••••••' : ''"
+                :placeholder="settings.password_configured ? trans.passwordConfiguredHint : ''"
               >
               <button type="button" class="password-toggle" @click="$emit('toggle-password', 'password')">
                 {{ passwordVisible.password ? '🙈' : '👁️' }}
@@ -743,7 +743,7 @@
                 data-form-type="other"
                 v-model="settings.confirm_password"
                 class="form-input"
-                :placeholder="settings.password_configured ? '••••••••' : ''"
+                :placeholder="settings.password_configured ? trans.passwordConfiguredHint : ''"
               >
               <button type="button" class="password-toggle" @click="$emit('toggle-password', 'confirmPassword')">
                 {{ passwordVisible.confirmPassword ? '🙈' : '👁️' }}

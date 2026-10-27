@@ -21,7 +21,7 @@
         </div>
         <div class="login-form-group">
           <label class="login-label">{{ trans.username }}</label>
-          <input type="text" name="username" autocomplete="username" v-model="loginForm.username" required class="login-input" placeholder="admin">
+          <input type="text" name="username" autocomplete="username" v-model="loginForm.username" required class="login-input">
         </div>
         <div class="login-form-group last">
           <label class="login-label">{{ trans.password }}</label>
