@@ -1274,6 +1274,11 @@ const handleLogin = async () => {
     syncApiIndexQuery()
     clearTurnstile()
     turnstileVerified.value = hasSharedTurnstileVerified()
+    // A bootstrap session may only set a password: force that form open.
+    if (result.data && result.data.bootstrap) {
+      changeAdminPassword.value = true
+      activeTab.value = 'settings'
+    }
     await Promise.all([
       loadSettings(),
       loadServers(),
@@ -1670,6 +1675,11 @@ const saveSettings = async () => {
       clearAdminPasswordInputs()
       changeAdminPassword.value = false
       settings.value.jwt_secret = ''
+      // The bootstrap session has served its purpose: an independent password
+      // now exists, so the panel is no longer restricted to the password form.
+      if (localStorage.getItem(STORAGE.BOOTSTRAP_SESSION)) {
+        localStorage.removeItem(STORAGE.BOOTSTRAP_SESSION)
+      }
       loadSettings()
     } else {
       saveResult.value = { success: false, error: getMessage(result.error) || 'fail' }

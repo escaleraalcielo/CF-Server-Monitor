@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateCredentials, generateToken } from '../src/middleware/auth.js';
+import { validateCredentials, generateToken, getAuthPayload } from '../src/middleware/auth.js';
 import { timingSafeEqualString } from '../src/utils/common.js';
 
 test('timingSafeEqualString matches only identical strings', async () => {
@@ -16,14 +16,35 @@ test('timingSafeEqualString rejects non-string values', async () => {
   assert.equal(await timingSafeEqualString('secret', undefined), false);
 });
 
-test('admin login is refused when no independent password is configured', async () => {
+test('admin login falls back to the default credentials only as a bootstrap session', async () => {
   const env = { API_SECRET: 'shared-agent-secret' };
   const sys = { username: 'admin' };
 
-  const result = await validateCredentials('admin', 'shared-agent-secret', env, sys);
+  // A fresh install has no admin password yet; the documented default
+  // credentials must still work, but the session is bootstrap-scoped.
+  const bootstrap = await validateCredentials('admin', 'shared-agent-secret', env, sys);
+  assert.equal(bootstrap.valid, true);
+  assert.equal(bootstrap.bootstrap, true);
 
-  assert.equal(result.valid, false);
-  assert.equal(result.needsPasswordUpgrade, false);
+  // Any other password is rejected.
+  const wrong = await validateCredentials('admin', 'wrong-password', env, sys);
+  assert.equal(wrong.valid, false);
+  assert.equal(wrong.bootstrap, false);
+
+  // The default username still applies.
+  const wrongUser = await validateCredentials('root', 'shared-agent-secret', env, sys);
+  assert.equal(wrongUser.valid, false);
+});
+
+test('the shared secret is never an admin credential once a password is configured', async () => {
+  const { hashPassword } = await import('../src/utils/common.js');
+  const storedHash = await hashPassword('correct-horse-battery-staple');
+  const env = { API_SECRET: 'shared-agent-secret' };
+  const sys = { username: 'admin', password: storedHash };
+
+  const sharedSecret = await validateCredentials('admin', 'shared-agent-secret', env, sys);
+  assert.equal(sharedSecret.valid, false);
+  assert.equal(sharedSecret.bootstrap, false);
 });
 
 test('admin login accepts a configured password hash and rejects wrong ones', async () => {
@@ -34,6 +55,7 @@ test('admin login accepts a configured password hash and rejects wrong ones', as
 
   const ok = await validateCredentials('admin', 'correct-horse-battery-staple', env, sys);
   assert.equal(ok.valid, true);
+  assert.equal(ok.bootstrap, false);
 
   const bad = await validateCredentials('admin', 'wrong-password', env, sys);
   assert.equal(bad.valid, false);
@@ -78,4 +100,25 @@ test('JWT tokens are base64url encoded and survive a query string round trip', a
   const roundTripped = new URL(url.toString()).searchParams.get('token');
 
   assert.equal(roundTripped, token);
+});
+
+test('a bootstrap token is scoped and cannot act as a normal admin session', async () => {
+  const env = { API_SECRET: 'shared-agent-secret', JWT_SECRET: 'j'.repeat(32) };
+  const sys = { username: 'admin' };
+
+  const bootstrapToken = await generateToken(env, sys, { scope: 'bootstrap' });
+  const adminToken = await generateToken(env, sys);
+
+  const bootstrapRequest = new Request('https://example.com/admin/api', {
+    headers: { Authorization: `Bearer ${bootstrapToken}` }
+  });
+  const adminRequest = new Request('https://example.com/admin/api', {
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+
+  const bootstrapPayload = await getAuthPayload(bootstrapRequest, env, sys);
+  assert.equal(bootstrapPayload.scope, 'bootstrap');
+
+  const adminPayload = await getAuthPayload(adminRequest, env, sys);
+  assert.equal(adminPayload.scope, undefined);
 });
