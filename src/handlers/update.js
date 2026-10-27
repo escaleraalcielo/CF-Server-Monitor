@@ -1,5 +1,5 @@
 import { saveMetricsHistory } from '../database/schema.js';
-import { getServerDetail, clearServerDetailCache, patchServerDetailCache } from '../utils/cache.js';
+import { getServerDetail, clearServerDetailCache, clearLatestMetricsCache, patchServerDetailCache } from '../utils/cache.js';
 import { evaluateTrafficAlert } from '../services/notification.js';
 import {
   DISK_IO_FIELD_TO_COLUMN,
@@ -741,6 +741,9 @@ async function handleUpdateCore(request, env, ctx, discovery) {
       latestSample.ts,
       agentVersion
     );
+    // 刚写入的新指标必须立即可见：latestAllCache 是 30 秒的 isolate 缓存，
+    // 不失效的话新上线的服务器在这段时间内会被当成没有数据而显示为离线。
+    clearLatestMetricsCache();
 
     const broadcastSamples = toBroadcastSamples(id, samples, regionCode, agentVersion, latestMetrics);
     cacheLatestReportUpdate(id, broadcastSamples, Date.now());
