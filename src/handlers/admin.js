@@ -5,6 +5,7 @@ import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigure
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
 import { normalizePctOrNull } from '../utils/traffic.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
+import { clearLoginFailures, getLoginBackoffMs, registerLoginFailure } from '../utils/loginRateLimit.js';
 import { AppError, createSuccessResponse, createBadRequestResponse, createUnauthorizedResponse, createErrorResponse } from '../utils/errors.js';
 import { addServerColumns } from '../database/updateDatabase.js';
 import { clearResourceAlertState, isSmtpNotificationTarget, sendNotification } from '../services/notification.js';
@@ -469,6 +470,12 @@ async function handleLoginAction({ request, env, sys, data }) {
     return createBadRequestResponse('missingCredentials');
   }
 
+  // 暴力破解抑制：处于退避窗口内直接拒绝，不再消耗 PBKDF2 校验开销。
+  const backoffMs = getLoginBackoffMs(request);
+  if (backoffMs > 0) {
+    return createErrorResponse(new AppError('tooManyAttempts', 429));
+  }
+
   const turnstileEnabled = sys && (sys.turnstile_enabled === 'true' || sys.turnstile_enabled === true);
   const turnstileLoginEnabled = sys && (sys.turnstile_login_enabled === 'true' || sys.turnstile_login_enabled === true);
   const turnstileSecretKey = sys && sys.turnstile_secret_key || '';
@@ -485,8 +492,11 @@ async function handleLoginAction({ request, env, sys, data }) {
   const credentialResult = await validateCredentials(username, password, env, sys);
 
   if (!credentialResult.valid) {
+    registerLoginFailure(request);
     return createUnauthorizedResponse('invalidCredentials');
   }
+
+  clearLoginFailures(request);
 
   if (credentialResult.needsPasswordUpgrade) {
     try {

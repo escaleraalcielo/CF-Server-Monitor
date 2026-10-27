@@ -488,6 +488,7 @@ test('WSS agent context asks the agent to retry when lookup throws before auth',
   const sent = [];
   const closed = [];
   const broadcaster = makeBroadcaster([], {
+    API_SECRET: 'test-secret',
     DB: {
       prepare() {
         return {
@@ -515,7 +516,8 @@ test('WSS agent context asks the agent to retry when lookup throws before auth',
     authenticated: false,
     serverId: ''
   }, {
-    id: 'degraded-server-2'
+    id: 'degraded-server-2',
+    secret: 'test-secret'
   });
 
   assert.equal(context, null);

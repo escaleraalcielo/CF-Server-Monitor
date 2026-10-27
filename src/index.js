@@ -439,19 +439,8 @@ export default {
           return response;
         }
 
-        if (setTurnstileVerified) {
-          const finalHeaders = new Headers(response.headers);
-          finalHeaders.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '');
-          finalHeaders.set('Access-Control-Allow-Credentials', 'true');
-          finalHeaders.set('Vary', 'Origin');
-
-          return new Response(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: finalHeaders
-          });
-        }
-
+        // Turnstile 通过不代表可以跨域：统一走 CORS 白名单，
+        // 否则任意站点都能拿到带凭证（cfsm_auth Cookie）的响应。
         return applyCors(response, request, corsAllowedOrigins);
       }
     }
