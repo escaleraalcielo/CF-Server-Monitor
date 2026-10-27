@@ -172,16 +172,44 @@ const CURRENCY_ALIASES = Object.freeze({
 })
 
 export function normalizeFinanceCurrency(value) {
-  const raw = String(value || 'CNY').trim()
-  if (!raw) return 'CNY'
-
+  if (!value) return 'CNY'
+  const raw = String(value).trim()
   const upper = raw.toUpperCase()
   const code = CURRENCY_ALIASES[raw] || CURRENCY_ALIASES[upper] || upper
   return DEFAULT_EXCHANGE_RATES[code] ? code : 'CNY'
 }
 
-export function getStoredFinanceCurrency() {
-  return normalizeFinanceCurrency(getLocalStorageItem(FINANCE_CURRENCY_KEY) || 'CNY')
+// Map a UI language to the currency its users are most likely to expect.
+// The panel's accounting base is CNY (server prices are stored in CNY and
+// converted for display), so CNY stays the fallback for anything unknown.
+const LANGUAGE_CURRENCY = Object.freeze({
+  zh: 'CNY',
+  'zh-TW': 'TWD',
+  en: 'USD',
+  ja: 'JPY',
+  id: 'IDR',
+  fr: 'EUR',
+  es: 'EUR'
+})
+
+/**
+ * The currency to display when the user has not chosen one.
+ * Uses the active UI language, so an English UI shows USD rather than CNY.
+ * @param {string} languageCode active UI language code
+ * @returns {string} currency code
+ */
+export function getDefaultFinanceCurrency(languageCode) {
+  const code = String(languageCode || '').trim()
+  const mapped = LANGUAGE_CURRENCY[code]
+  return mapped && DEFAULT_EXCHANGE_RATES[mapped] ? mapped : 'CNY'
+}
+
+export function getStoredFinanceCurrency(languageCode) {
+  const stored = getLocalStorageItem(FINANCE_CURRENCY_KEY)
+  if (stored) {
+    return normalizeFinanceCurrency(stored)
+  }
+  return getDefaultFinanceCurrency(languageCode)
 }
 
 export function setStoredFinanceCurrency(currency) {

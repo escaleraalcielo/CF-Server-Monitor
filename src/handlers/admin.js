@@ -1,4 +1,4 @@
-import { buildAuthCookie, buildClearAuthCookie, checkAuth, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
+import { buildAuthCookie, buildClearAuthCookie, checkAuth, getAuthPayload, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
 import { getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, clearServersListCache } from '../utils/cache.js';
 import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
@@ -511,10 +511,15 @@ async function handleLoginAction({ request, env, sys, data }) {
   }
 
   try {
-    const token = await generateToken(env, sys);
+    // A bootstrap login (default credentials on a fresh install) is scoped so
+    // it can only be used to set an independent password. It never grants
+    // panel access.
+    const scope = credentialResult.bootstrap ? 'bootstrap' : null;
+    const token = await generateToken(env, sys, scope ? { scope } : {});
     return createSuccessResponse({
       success: true,
       token: token,
+      bootstrap: !!credentialResult.bootstrap,
       message: 'loginSuccessful'
     }, {
       'Set-Cookie': buildAuthCookie(request, token)
@@ -770,6 +775,19 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
 
     if (!await checkAuth(request, env, sys)) {
       return simpleAuthResponse();
+    }
+
+    // A bootstrap session (logged in with the default credentials on a fresh
+    // install) may only read what the panel needs to render the forced
+    // password form, and set that password. Everything else is refused until
+    // an independent password exists.
+    const authPayload = await getAuthPayload(request, env, sys);
+    if (authPayload && authPayload.scope === 'bootstrap') {
+      const BOOTSTRAP_READ_ACTIONS = new Set(['get_settings', 'list']);
+      const isPasswordChange = data.action === 'save_settings' && String(data.settings?.password || '').length > 0;
+      if (!BOOTSTRAP_READ_ACTIONS.has(data.action) && !isPasswordChange) {
+        return createErrorResponse(new AppError('bootstrapPasswordRequired', 403));
+      }
     }
 
     const authenticatedActionHandler = AUTHENTICATED_ADMIN_ACTION_HANDLERS[data.action];

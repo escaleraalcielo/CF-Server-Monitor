@@ -993,10 +993,10 @@ const settings = ref({
   custom_cu: '',
   custom_cm: '',
   custom_bd: '',
-  custom_ct_name: '电信',
-  custom_cu_name: '联通',
-  custom_cm_name: '移动',
-  custom_bd_name: 'BGP',
+  custom_ct_name: '',
+  custom_cu_name: '',
+  custom_cm_name: '',
+  custom_bd_name: '',
   theme_url: '',
   csp_static: '',
   csp_api: ''
@@ -1274,6 +1274,11 @@ const handleLogin = async () => {
     syncApiIndexQuery()
     clearTurnstile()
     turnstileVerified.value = hasSharedTurnstileVerified()
+    // A bootstrap session may only set a password: force that form open.
+    if (result.data && result.data.bootstrap) {
+      changeAdminPassword.value = true
+      activeTab.value = 'settings'
+    }
     await Promise.all([
       loadSettings(),
       loadServers(),
@@ -1447,11 +1452,11 @@ const loadSettings = async () => {
         custom_cm: settingsData.custom_cm || '',
         custom_bd: settingsData.custom_bd || '',
         node_1: settingsData.node_1 || '', node_2: settingsData.node_2 || '', node_3: settingsData.node_3 || '', node_4: settingsData.node_4 || '',
-        custom_ct_name: settingsData.custom_ct_name || '电信',
-        custom_cu_name: settingsData.custom_cu_name || '联通',
-        custom_cm_name: settingsData.custom_cm_name || '移动',
-        custom_bd_name: settingsData.custom_bd_name || 'BGP',
-        node_1_name: settingsData.node_1_name || 'Node 1', node_2_name: settingsData.node_2_name || 'Node 2', node_3_name: settingsData.node_3_name || 'Node 3', node_4_name: settingsData.node_4_name || 'Node 4',
+        custom_ct_name: settingsData.custom_ct_name || '',
+        custom_cu_name: settingsData.custom_cu_name || '',
+        custom_cm_name: settingsData.custom_cm_name || '',
+        custom_bd_name: settingsData.custom_bd_name || '',
+        node_1_name: settingsData.node_1_name || '', node_2_name: settingsData.node_2_name || '', node_3_name: settingsData.node_3_name || '', node_4_name: settingsData.node_4_name || '',
         theme_url: settingsData.theme_url || '',
         csp_static: settingsData.csp_static || '',
         csp_api: settingsData.csp_api || ''
@@ -1670,6 +1675,11 @@ const saveSettings = async () => {
       clearAdminPasswordInputs()
       changeAdminPassword.value = false
       settings.value.jwt_secret = ''
+      // The bootstrap session has served its purpose: an independent password
+      // now exists, so the panel is no longer restricted to the password form.
+      if (localStorage.getItem(STORAGE.BOOTSTRAP_SESSION)) {
+        localStorage.removeItem(STORAGE.BOOTSTRAP_SESSION)
+      }
       loadSettings()
     } else {
       saveResult.value = { success: false, error: getMessage(result.error) || 'fail' }

@@ -1,5 +1,5 @@
 const ALGORITHM = { name: 'HMAC', hash: 'SHA-256' };
-import { verifyPasswordHash } from '../utils/common.js';
+import { verifyPasswordHash, timingSafeEqualString } from '../utils/common.js';
 import { isValidJwtSecret } from '../utils/settings.js';
 
 export const AUTH_COOKIE_NAME = 'cfsm_auth';
@@ -125,40 +125,64 @@ function extractBearerToken(request) {
   return parts[0] === 'Bearer' && parts[1] ? parts[1] : '';
 }
 
+/**
+ * Verify a bearer/cookie token.
+ * @returns {Promise<object|null>} the decoded payload, or null when invalid
+ */
 async function verifyToken(token, env, sys) {
-  if (!token) return false;
-  const secret = getJwtSecret(env, sys);
+  if (!token) return null;
 
   try {
-    const payload = await verifyJwt(token, secret);
-    return payload !== null;
+    // getJwtSecret throws when no JWT secret is configured. That must degrade to
+    // "not authenticated", never to a 500 for the whole request.
+    const secret = getJwtSecret(env, sys);
+    return await verifyJwt(token, secret);
   } catch (e) {
     console.error('Auth check error:', e);
-    return false;
+    return null;
   }
 }
 
-export async function generateToken(env, sys) {
+export async function generateToken(env, sys, options = {}) {
   const payload = {
     sub: 'admin',
     iat: Math.floor(Date.now() / 1000),
     exp: Math.floor(Date.now() / 1000) + 604800
   };
 
+  // A bootstrap session is issued when the panel is logged in with the
+  // default credentials (no admin password has been configured yet). It is
+  // restricted to the password-change flow and carries `scope: 'bootstrap'`,
+  // so it cannot be used to administer the panel.
+  if (options.scope) {
+    payload.scope = options.scope;
+  }
+
   const secret = getJwtSecret(env, sys);
   return signJwt(payload, secret);
 }
 
-export async function checkAuth(request, env, sys) {
-  if (await verifyToken(extractBearerToken(request), env, sys)) {
-    return true;
+/**
+ * Verify a request's credentials and return the decoded token payload.
+ * @returns {Promise<object|null>} payload when authenticated, else null
+ */
+export async function getAuthPayload(request, env, sys) {
+  let payload = await verifyToken(extractBearerToken(request), env, sys);
+  if (!payload) {
+    payload = await verifyToken(getCookieValue(request, AUTH_COOKIE_NAME), env, sys);
   }
-  return verifyToken(getCookieValue(request, AUTH_COOKIE_NAME), env, sys);
+  return payload;
+}
+
+export async function checkAuth(request, env, sys) {
+  return !!(await getAuthPayload(request, env, sys));
 }
 
 export async function checkWebSocketAuth(request, env, sys) {
-  if (await checkAuth(request, env, sys)) {
-    return true;
+  const payload = await getAuthPayload(request, env, sys);
+  if (payload) {
+    // A bootstrap session must not receive the live metrics stream.
+    return payload.scope !== 'bootstrap';
   }
 
   let url;
@@ -169,8 +193,9 @@ export async function checkWebSocketAuth(request, env, sys) {
   }
 
   for (const key of TOKEN_QUERY_KEYS) {
-    if (await verifyToken(url.searchParams.get(key), env, sys)) {
-      return true;
+    const queryPayload = await verifyToken(url.searchParams.get(key), env, sys);
+    if (queryPayload) {
+      return queryPayload.scope !== 'bootstrap';
     }
   }
   return false;
@@ -202,16 +227,33 @@ export async function validateCredentials(username, password, env, sys) {
       const result = await verifyPasswordHash(password, sys.password);
       return {
         valid: result.valid,
-        needsPasswordUpgrade: result.needsRehash === true
+        needsPasswordUpgrade: result.needsRehash === true,
+        bootstrap: false
       };
     }
 
-    // 未在后台设置独立管理员密码时直接拒绝登录：
-    // API_SECRET 是所有 Agent 共用的上报密钥，写在每台被监控主机的配置文件里，
-    // 拿它当管理员密码意味着任意一台主机泄露即可接管整个面板。
-    // 兼容路径仅保留给显式配置 API_USER_NAME 且设置了独立密码的部署。
-    console.warn('[Auth] 拒绝登录：尚未设置独立的管理员密码');
-    return { valid: false, needsPasswordUpgrade: false };
+    // No admin password has been configured yet. This is the state of a fresh
+    // install, where the documented default credentials are `admin` and
+    // API_SECRET. Allow that login so a new deployment is not locked out of
+    // its own panel, but mark it as a bootstrap session: it can only be used
+    // to set an independent password, and it never grants panel access.
+    //
+    // The shared ingest secret lives in the config file of every monitored
+    // host, so it must not be an ongoing administrator credential.
+    if (typeof env.API_SECRET !== 'string' || env.API_SECRET.length === 0) {
+      return { valid: false, needsPasswordUpgrade: false };
+    }
+
+    if (username !== validUsername) {
+      return { valid: false, needsPasswordUpgrade: false };
+    }
+
+    const secretMatches = await timingSafeEqualString(password, env.API_SECRET);
+    return {
+      valid: secretMatches,
+      needsPasswordUpgrade: false,
+      bootstrap: secretMatches
+    };
   } catch (e) {
     console.error('Credential validation error:', e);
     return { valid: false, needsPasswordUpgrade: false };
