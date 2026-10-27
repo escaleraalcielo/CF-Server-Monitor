@@ -51,16 +51,19 @@ test('an explicitly stored display currency wins over the language default', () 
   assert.equal(getStoredFinanceCurrency('zh-TW'), 'HKD')
 })
 
+const createEmptySettingsDb = () => ({
+  prepare: () => ({
+    bound: null,
+    bind(...args) { this.bound = args; return this },
+    first: async () => null,
+    all: async () => ({ results: [] }),
+    run: async () => ({ success: true })
+  })
+})
+
 test('site settings defaults leave carrier display names empty for locale fallback', async () => {
   clearSiteSettingsCache()
-  const db = {
-    prepare: () => ({
-      first: async () => null,
-      all: async () => ({ results: [] }),
-      run: async () => {}
-    })
-  }
-  const settings = await loadSiteSettings(db, { forceRefresh: true })
+  const settings = await loadSiteSettings(createEmptySettingsDb(), { forceRefresh: true })
   for (const field of ['custom_ct_name', 'custom_cu_name', 'custom_cm_name', 'custom_bd_name']) {
     assert.equal(settings[field], '', `${field} must stay empty so the frontend can use the locale label`)
   }
@@ -68,6 +71,46 @@ test('site settings defaults leave carrier display names empty for locale fallba
   assert.equal(settings.node_2_name, 'Node 2')
   assert.equal(settings.node_3_name, 'Node 3')
   assert.equal(settings.node_4_name, 'Node 4')
+  // A persisted jwt secret proves the happy path ran; the swallowed-error fallback would leave it empty.
+  assert.ok(settings.jwt_secret.length >= 32)
+})
+
+test('legacy carrier display names stored by older versions are treated as unset', async () => {
+  clearSiteSettingsCache()
+  const legacySiteOptions = JSON.stringify({
+    jwt_secret: 'x'.repeat(32),
+    custom_ct_name: '电信',
+    custom_cu_name: '联通',
+    custom_cm_name: '移动',
+    custom_bd_name: 'BGP',
+    node_1_name: 'MyEdge'
+  })
+  const db = {
+    prepare: () => ({
+      bound: null,
+      bind(...args) { this.bound = args; return this },
+      first: async () => ({ value: legacySiteOptions }),
+      all: async () => ({ results: [] }),
+      run: async () => ({ success: true })
+    })
+  }
+  const settings = await loadSiteSettings(db, { forceRefresh: true })
+  for (const field of ['custom_ct_name', 'custom_cu_name', 'custom_cm_name', 'custom_bd_name']) {
+    assert.equal(settings[field], '', `legacy default in ${field} must be normalised to an empty string`)
+  }
+  assert.equal(settings.node_1_name, 'MyEdge', 'operator-set node names must survive')
+
+  clearSiteSettingsCache()
+  const customSiteOptions = JSON.stringify({ jwt_secret: 'x'.repeat(32), custom_ct_name: 'MyISP' })
+  const customDb = {
+    prepare: () => ({
+      first: async () => ({ value: customSiteOptions }),
+      all: async () => ({ results: [] }),
+      run: async () => ({ success: true })
+    })
+  }
+  const customSettings = await loadSiteSettings(customDb, { forceRefresh: true })
+  assert.equal(customSettings.custom_ct_name, 'MyISP', 'operator-set carrier names must survive')
 })
 
 test('ping labels prefer the custom name, then the active locale, then a neutral fallback', async () => {

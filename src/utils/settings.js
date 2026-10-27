@@ -629,6 +629,24 @@ async function ensurePersistedJwtSecret(db, result, siteOptions) {
   return saveJwtSecretIfMissing(db, secret);
 }
 
+// 旧版本曾把运营商名的中文默认值当作站点设置写入 site_options；这些历史值等价于“未自定义”，
+// 读取时归一为空串，让前端按当前语言回退到 locale 文案。BGP 在所有语言下显示一致，同样归一。
+// node_N_name 不在此列：它们没有 locale 键，清空会回退成 NODE_1 等不可读标签。
+const LEGACY_PING_NODE_DISPLAY_DEFAULTS = Object.freeze({
+  custom_ct_name: '电信',
+  custom_cu_name: '联通',
+  custom_cm_name: '移动',
+  custom_bd_name: 'BGP'
+});
+
+function normalizeLegacyPingNodeDisplayNames(settings) {
+  for (const [field, legacyDefault] of Object.entries(LEGACY_PING_NODE_DISPLAY_DEFAULTS)) {
+    if (settings[field] === legacyDefault) {
+      settings[field] = '';
+    }
+  }
+}
+
 export async function loadSiteSettings(db, options = {}) {
   const forceRefresh = options === true || Boolean(options && options.forceRefresh);
   const now = Date.now();
@@ -656,6 +674,7 @@ export async function loadSiteSettings(db, options = {}) {
       copyFields(result, await loadLegacySettings(db, SITE_FIELDS), SITE_FIELDS);
     }
     copyFields(result, siteOptions, SITE_FIELDS);
+    normalizeLegacyPingNodeDisplayNames(result);
 
     if (!isValidJwtSecret(siteOptions?.jwt_secret) || !isValidJwtSecret(result.jwt_secret)) {
       result.jwt_secret = await ensurePersistedJwtSecret(db, result, siteOptions);
