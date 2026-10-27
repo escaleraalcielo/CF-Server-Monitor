@@ -1388,7 +1388,7 @@ const loadLatestAgentVersion = async () => {
   }
 }
 
-const loadSettings = async () => {
+const loadSettings = async (overrides = {}) => {
   try {
     const result = await adminApiForSite({ action: 'get_settings' })
     if (!result.error) {
@@ -1438,8 +1438,10 @@ const loadSettings = async () => {
         cloudflare_account_id: settingsData.cloudflare_account_id || '',
         cloudflare_token: settingsData.cloudflare_token || '',
         jwt_secret: '',
-        username: settingsData.username || '',
-        password_configured: settingsData.password_configured === true,
+        username: overrides.username || settingsData.username || '',
+        // 站点设置在服务端按 isolate 缓存 120 秒，密码刚保存后重新拉取仍可能拿到
+        // “未配置密码”的旧值。已经确认配置过的密码不应被旧值降级回去。
+        password_configured: settingsData.password_configured === true || overrides.password_configured === true || settings.value.password_configured === true,
         password: '',
         confirm_password: '',
         custom_ct: settingsData.custom_ct || '',
@@ -1671,12 +1673,12 @@ const saveSettings = async () => {
       clearAdminPasswordInputs()
       changeAdminPassword.value = false
       settings.value.jwt_secret = ''
-      // 密码已保存：立即标记为已配置，避免随后的保存（例如切换主题）仍按旧状态
-      // 提示“请先设置密码”。loadSettings() 读到的可能是其它 isolate 的旧缓存。
-      if (passwordWasSubmitted) {
-        settings.value.password_configured = true
-      }
-      loadSettings()
+      // 密码刚保存：紧接着的重新拉取可能仍拿到其它 isolate 的旧缓存（站点设置缓存 120 秒），
+      // 因此把刚保存的用户名与“已配置密码”状态一并传下去，避免表单被旧值覆盖回去。
+      await loadSettings({
+        username: data.settings.username || settings.value.username,
+        password_configured: passwordWasSubmitted ? true : undefined
+      })
     } else {
       saveResult.value = { success: false, error: getMessage(result.error) || 'fail' }
     }

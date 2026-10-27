@@ -482,7 +482,19 @@ async function handleLoginAction({ request, env, sys, data }) {
     }
   }
 
-  const credentialResult = await validateCredentials(username, password, env, sys);
+  let credentialResult = await validateCredentials(username, password, env, sys);
+
+  if (!credentialResult.valid) {
+    // 站点设置按 isolate 缓存 120 秒，刚保存的新密码或新用户名在其它 isolate 上
+    // 可能还没生效。校验失败时强制读一次 D1 再试一次，避免刚改完密码却登不上。
+    const freshSettings = await loadSiteSettings(env.DB, { forceRefresh: true });
+    if (freshSettings) {
+      credentialResult = await validateCredentials(username, password, env, freshSettings);
+      if (credentialResult.valid) {
+        Object.assign(sys, freshSettings);
+      }
+    }
+  }
 
   if (!credentialResult.valid) {
     return createUnauthorizedResponse('invalidCredentials');
