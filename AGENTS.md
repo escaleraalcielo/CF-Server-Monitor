@@ -155,6 +155,16 @@ git pull && npm install && npm run build:frontend && npx wrangler deploy
 npx wrangler secret put API_SECRET
 # then, per host: cf-probe install -id=<UUID> -secret='<NEW>' -url='https://monitor.cachorro-server.stream/update'
 
+# NOTE: the Durable Object singleton (idFromName('global')) can keep serving the
+# OLD secret for a couple of minutes after the rotation, while the Worker's HTTP
+# path already accepts the new one. The agent then logs
+#   server error code=401 Invalid secret
+# and recovers by itself on the next retry (backoff caps at 5m). Do NOT re-issue the
+# rotation in response — check with:
+#   curl -X POST https://monitor.cachorro-server.stream/update -H "X-API-Secret: <NEW>" ...
+# (200 = the Worker is already on the new secret) and wait for `WSS connected`.
+# Re-running `secret put` restarts the clock and extends the outage.
+
 # Rotate the admin password
 # Admin panel → Settings → Security → password (stored as a PBKDF2 hash)
 
