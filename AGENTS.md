@@ -127,10 +127,23 @@ chmod +x cf-probe
 - The agent's `install` command embeds `-secret` in argv, so it is briefly visible in
   `ps` during installation. Avoid running it from a shared shell history.
 
-### isengard (this host)
-- Service: `cf-probe.service` (systemd **user** unit, `daniel`)
-- Server UUID: `1b7ed4aa-a16f-410d-9c98-545e12a3fd3c`
+### Monitored servers
+
+All four run the agent as a **non-root** systemd user unit, config mode 0600,
+`loginctl enable-linger` set so they survive logout and reboot.
+
+| Host | SSH | User | Server UUID | Install dir |
+|------|-----|------|-------------|-------------|
+| isengard | `isengard` | daniel | `1b7ed4aa-a16f-410d-9c98-545e12a3fd3c` | `~/.cf-probe/` |
+| rivendell | `rivendell` | ubuntu | `40b59591-5142-4142-8eab-e10e7641dc8e` | `~/.cf-probe/` |
+| erebor | `erebor` | ubuntu | `4804745b-6f12-4d68-a07a-2d3adcfe6e86` | `~/.cf-probe/` |
+| gondor | `gondor` | root → `cfsm` | `08439a19-f66f-40d7-883a-645a270d9cf0` | `/home/cfsm/.cf-probe/` |
+
 - Status: `systemctl --user status cf-probe` · Logs: `journalctl --user -u cf-probe -f`
+- `gondor` runs as a dedicated `cfsm` system user (not root); its user unit must be
+  enabled as that user: `sudo -u cfsm -H XDG_RUNTIME_DIR=/run/user/993 systemctl --user enable cf-probe.service`.
+  Without `XDG_RUNTIME_DIR` the enable silently no-ops and the service does not
+  start on boot.
 
 ---
 
