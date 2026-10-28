@@ -96,10 +96,13 @@ budget rather than on a fixed per-request wall, and the reported figure is not t
 work that was attempted. Treat the Worker side as "well under the DO's 30 s and comfortably
 above what this Worker uses", not as a precise number.
 
-What is not in doubt: the Free plan *documents* 10 ms of CPU per Worker request, the runtime
-enforces it with far more tolerance than that, and a Durable Object's 30 s is a separate and
-exactly enforced budget (the DO class's `limits.cpu_ms` default — the same on Free and Paid,
-not a plan allowance).
+What is not in doubt: the Free plan *documents* 10 ms of CPU per Worker request, and the runtime
+enforces it with far more tolerance than that. The Durable Object's 30 s is a separate budget
+that was **measured here** (exactly 30000 ms, `exceededCpu`); the DO limits table also lists
+30 s as the default, and describes the same number as the DO class's `limits.cpu_ms` default
+rather than a plan allowance. The two sources are not fully consistent with each other — the
+DO FAQ says Durable Objects share the per-invocation limits of any Worker, while the limits
+table gives Durable Objects 30 s — so trust the measurement over the prose.
 
 So:
 
