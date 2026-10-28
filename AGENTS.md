@@ -78,31 +78,42 @@ Two things worth keeping straight:
 > A hash below the current count is only flagged for a rewrite when the password was
 > **correct** — matching the legacy-MD5 branch — so a failed login never rewrites the row.
 
-### Where heavy work belongs: the DO has 30 s, a Worker request has ~1 s
+### Where heavy work belongs: the DO has 30 s, a Worker request has no clean ceiling
 
 Measured on this account (Workers Free) on 2026-10-28 with a throwaway probe worker, burning
 CPU in repeated 100 000-iteration PBKDF2 derivations (13 ms of accounted CPU each) and reading
 Cloudflare's own `cpuTime`/`outcome` from `wrangler tail`:
 
-| Path | Effective CPU ceiling | Reported at failure |
+| Path | Ceiling | Reported at failure |
 |---|---|---|
-| Worker request (stateless) | ~1 s — 624 ms survived, ~1 s+ killed | `exceededCpu`, cpuTime 126–2058 ms |
-| Durable Object invocation | **30 s** | `exceededCpu`, cpuTime exactly **30000 ms** |
+| Durable Object invocation | **30 s**, exactly | `exceededCpu`, cpuTime exactly **30000 ms** |
+| Worker request (stateless) | no clean per-request figure | `exceededCpu`, cpuTime 126–2058 ms for the same sweep |
 
-The Free plan *documents* 10 ms of CPU per Worker request, and the runtime enforces it with far
-more tolerance than that — a Worker request survived 624 ms of real CPU here. But that is
-**not** the same budget as a Durable Object's, which is enforced exactly at 30 s. So:
+Only the Durable Object number is quotable. The Worker side is **erratic**: 624 ms of real CPU
+survived, the kills came later, and the `cpuTime` Cloudflare reported for the killed
+invocations ranged from 126 ms to 2058 ms — so the runtime is terminating on a per-isolate
+budget rather than on a fixed per-request wall, and the reported figure is not the amount of
+work that was attempted. Treat the Worker side as "well under the DO's 30 s and comfortably
+above what this Worker uses", not as a precise number.
+
+What is not in doubt: the Free plan *documents* 10 ms of CPU per Worker request, the runtime
+enforces it with far more tolerance than that, and a Durable Object's 30 s is a separate and
+exactly enforced budget (the DO class's `limits.cpu_ms` default — the same on Free and Paid,
+not a plan allowance).
+
+So:
 
 - Anything that has to burn more than a few ms of CPU belongs in the **Durable Object**, not
   in the Worker request path.
-- The 30 s is the DO class's `limits.cpu_ms` default, not a plan allowance — it is the same on
-  Free and Paid.
+- Do not quote a Worker-request CPU ceiling from a single probe run; the number moves with
+  what the isolate did before it.
 
 The current split already respects this: the per-minute cron and the `/update` handler stay in
 the Worker and measure **6.5 ms average / 39 ms max**, while the metric fan-out to WebSocket
-subscribers runs in `MetricsBroadcaster` (**6.1 ms average / 14 ms max**). Both sit far below
-the ceiling that actually bites, which is why the panel has run two days with zero errors
-despite exceeding the documented 10 ms on its tail.
+subscribers runs in `MetricsBroadcaster` (**6.1 ms average / 14 ms max**). Both are far below
+the Durable Object's 30 s and far below anything that has killed an invocation here, which is
+why the panel has run two days with zero errors despite exceeding the documented 10 ms on its
+tail.
 
 ### What the browser may see (2026-10-28)
 
