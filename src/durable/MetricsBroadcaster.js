@@ -22,7 +22,10 @@ import { evaluateTrafficAlert } from '../services/notification.js';
 import { ensureServerOptimization } from '../database/indexOptimization.js';
 import { getServerDetail, clearServerDetailCache } from '../utils/cache.js';
 import { getWssReportScheduleState, loadSiteSettings } from '../utils/settings.js';
-import { timingSafeEqualString } from '../utils/common.js';
+import {
+  AGENT_CREDENTIAL_NODE,
+  authenticateAgentCredential
+} from '../utils/agentTokens.js';
 import {
   AGENT_CONFIG_MD5_HEADER,
   AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
@@ -703,7 +706,25 @@ export class MetricsBroadcaster {
 
     const hasSecret = Object.prototype.hasOwnProperty.call(data, 'secret');
     if (!attachment.authenticated || hasSecret) {
-      if (!await timingSafeEqualString(data.secret, this.env.API_SECRET)) {
+      // 凭据可以是共享密钥 env.API_SECRET，也可以是某个节点自己的令牌。
+      // 共享密钥的使用次数在这里计数：Agent 走 WSS 上报时，HTTP 路径上的计数不会动，
+      // 管理员要看到共享密钥真正被弃用，这条路径必须也算。
+      const credential = await authenticateAgentCredential(
+        this.env.DB,
+        data.secret,
+        this.env.API_SECRET,
+        { ctx: this.state }
+      );
+      if (!credential.ok) {
+        this._closeWsWithError(ws, 'Invalid secret', 401);
+        return null;
+      }
+      // 节点令牌只认它自己那台机器：拿 A 的令牌报 B 直接 401。
+      if (
+        credential.kind === AGENT_CREDENTIAL_NODE &&
+        credential.serverId &&
+        credential.serverId !== serverId
+      ) {
         this._closeWsWithError(ws, 'Invalid secret', 401);
         return null;
       }
