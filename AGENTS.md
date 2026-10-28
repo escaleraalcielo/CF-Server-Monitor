@@ -48,6 +48,26 @@ npx wrangler secret put JWT_SECRET
 
 Local copies of the live credentials live at `~/.config/cf-server-monitor/credentials.env` (mode 600).
 
+> **`API_SECRET` was rotated 2026-10-28.** The previous value had been written into an
+> agent session log and was therefore uploaded to MEGA inside the AgentsView archive
+> (`~/.agentsview/sessions.db`, backed up nightly). Rotating invalidated it — every
+> candidate in that log is now rejected with 401 by `/update`. Because `API_SECRET` is
+> the **shared ingest secret**, the rotation is only safe if every agent is
+> re-provisioned in the same window: the worker, the local agent, and each remote
+> agent's `SECRET=` line (then restart its `cf-probe.service`).
+>
+> When rotating, keep the value out of transcripts and argv:
+> - generate it to a `umask 077` file, never echo it;
+> - `wrangler secret put API_SECRET < file`;
+> - ship it to a remote host over **stdin** (`ssh host 'cat > ~/.cf-probe/.newsec' < file`),
+>   not in a command line — the agent's own install template puts it in argv, which shows
+>   up in `ps` and in shell history;
+> - verify by hashing the value on each host, not by printing it.
+>
+> The agent config's `SECRET=` line has no spaces around `=` (`SECRET="..."`); a `sed`
+> pattern written for `SECRET = ...` silently matches nothing and leaves the host
+> reporting with the old secret.
+
 ---
 
 ## 3. Cron budget — READ BEFORE ADDING TRIGGERS
