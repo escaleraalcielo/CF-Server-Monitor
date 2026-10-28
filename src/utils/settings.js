@@ -17,15 +17,21 @@ export const SITE_FIELDS = ['auto_discovery', 'is_public', 'show_price', 'show_e
 
 // 凭据字段：读取接口只回传掩码，绝不把真实值发到浏览器。
 // 保存时掩码表示"管理员没有改动这一项"——保留库中原值；空字符串表示主动清空。
-export const SECRET_SETTING_FIELDS = ['turnstile_secret_key', 'cloudflare_token'];
+// tg_bot_token 同时承载 SMTP 渠道配置（smtp://user:pass@host:port），
+// 掩码保留 smtp: 前缀，这样前端的渠道识别不用改。
+export const SECRET_SETTING_FIELDS = ['turnstile_secret_key', 'cloudflare_token', 'tg_bot_token'];
 export const SECRET_MASK = '••••••••';
+const SMTP_MASK_PREFIX = 'smtp://';
 
 export function maskSecretValue(value) {
-  return String(value ?? '').trim() ? SECRET_MASK : '';
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  return raw.toLowerCase().startsWith('smtp:') ? SMTP_MASK_PREFIX + SECRET_MASK : SECRET_MASK;
 }
 
 export function isMaskedSecretValue(value) {
-  return String(value ?? '') === SECRET_MASK;
+  const raw = String(value ?? '');
+  return raw === SECRET_MASK || raw === SMTP_MASK_PREFIX + SECRET_MASK;
 }
 
 // 前端回传掩码 = 管理员没有改动这一项。把掩码从更新里摘掉，

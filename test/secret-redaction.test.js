@@ -117,6 +117,7 @@ test('credential settings are masked and reported as configured', () => {
     password: 'pbkdf2_sha256$50000$salt$hash',
     turnstile_secret_key: 'real-turnstile-secret',
     cloudflare_token: 'real-cloudflare-token',
+    tg_bot_token: '123456:telegram-bot-token',
     site_title: 'My panel'
   });
 
@@ -138,10 +139,38 @@ test('credential settings are masked and reported as configured', () => {
   assert.equal(isMaskedSecretValue('something-else'), false);
 });
 
+test('the Telegram/SMTP token mask keeps the smtp: prefix so the channel is still detected', () => {
+  const sanitized = sanitizeAdminSettings({
+    tg_bot_token: 'smtp://user:mailpass@smtp.example.com:587?secure=starttls'
+  });
+
+  // The frontend detects the SMTP channel with a "smtp:" prefix check, so the
+  // mask has to keep it - otherwise the panel would show the wrong channel.
+  assert.ok(
+    sanitized.tg_bot_token.startsWith('smtp:'),
+    'the SMTP mask must keep the smtp: prefix'
+  );
+  assert.ok(
+    sanitized.tg_bot_token.endsWith(SECRET_MASK),
+    'the SMTP mask must end with the mask'
+  );
+  assert.ok(
+    !sanitized.tg_bot_token.includes('mailpass'),
+    'the SMTP password must not survive masking'
+  );
+  assert.ok(
+    !sanitized.tg_bot_token.includes('smtp.example.com'),
+    'the SMTP host must not survive masking'
+  );
+  assert.equal(isMaskedSecretValue(sanitized.tg_bot_token), true);
+  assert.equal(sanitized.tg_bot_token_configured, true);
+});
+
 test('a no-op settings save preserves the stored credential', async () => {
   const stored = {
     turnstile_secret_key: 'real-turnstile-secret',
-    cloudflare_token: 'real-cloudflare-token'
+    cloudflare_token: 'real-cloudflare-token',
+    tg_bot_token: 'smtp://user:mailpass@smtp.example.com:587'
   };
   const db = makeSettingsDb(fullSiteOptions(stored));
 
@@ -149,12 +178,26 @@ test('a no-op settings save preserves the stored credential', async () => {
   const saved = await saveSiteOptions(db, {
     turnstile_secret_key: SECRET_MASK,
     cloudflare_token: SECRET_MASK,
+    tg_bot_token: 'smtp://' + SECRET_MASK,
     is_public: 'false'
   });
 
   assert.equal(saved.turnstile_secret_key, 'real-turnstile-secret');
   assert.equal(saved.cloudflare_token, 'real-cloudflare-token');
+  assert.equal(saved.tg_bot_token, 'smtp://user:mailpass@smtp.example.com:587');
   assert.equal(saved.is_public, 'false');
+});
+
+test('an explicitly cleared Telegram token still clears the stored one', async () => {
+  const db = makeSettingsDb(fullSiteOptions({
+    tg_bot_token: 'smtp://user:mailpass@smtp.example.com:587'
+  }));
+
+  // Switching the notification channel back to the built-in one sends an
+  // empty string, which is a deliberate clear - not an unchanged value.
+  const saved = await saveSiteOptions(db, { tg_bot_token: '' });
+
+  assert.equal(saved.tg_bot_token, '');
 });
 
 test('an explicitly changed credential replaces the stored one', async () => {

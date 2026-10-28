@@ -1066,6 +1066,16 @@ const SMTP_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 const isSmtpToken = token => String(token || '').trim().toLowerCase().indexOf('smtp:') === 0
 
+// 服务端把 tg_bot_token 回传成掩码，smtp:// 前缀保留。
+// 掩码不能拿去解析：解析出来的主机/账号/密码是 '••••'，
+// 再被 syncSmtpToken 序列化回去就会把库里真实的 SMTP 配置覆盖掉。
+const isMaskedToken = token => {
+  const mask = String(props.settings.secret_mask || '').trim()
+  const raw = String(token || '').trim()
+  if (!mask || !raw) return false
+  return raw === mask || raw.endsWith(mask)
+}
+
 const safeDecode = value => {
   try {
     return decodeURIComponent(value)
@@ -1198,8 +1208,13 @@ const notificationChannel = computed({
     }
     props.settings.notification_webhook_enabled = false
     if (value === 'smtp') {
-      if (isSmtpToken(props.settings.tg_bot_token)) {
+      if (isSmtpToken(props.settings.tg_bot_token) && !isMaskedToken(props.settings.tg_bot_token)) {
         applySmtpToken(props.settings.tg_bot_token)
+        smtpTokenApplied.value = true
+      } else if (isMaskedToken(props.settings.tg_bot_token)) {
+        // 库里已配置 SMTP，但服务端只给了掩码：表单留空，
+        // 不去解析掩码（否则会把 '••••' 解析成主机/账号再写回去）。
+        Object.assign(smtpConfig, defaultSmtpConfig())
         smtpTokenApplied.value = true
       } else {
         Object.assign(smtpConfig, defaultSmtpConfig())
@@ -1231,6 +1246,10 @@ watch(() => props.settings.tg_bot_token, (token) => {
   if (isSmtpToken(token)) {
     smtpChannelActive.value = true
     smtpTokenApplied.value = true
+    // 掩码只说明"库里配了 SMTP"，不是可解析的值：
+    // 解析它会把 '••••' 当成主机/账号/密码，再被 syncSmtpToken 写回去，
+    // 覆盖掉库里的真实配置。
+    if (isMaskedToken(token)) return
     if (buildSmtpToken(smtpConfig) !== String(token).trim()) {
       applySmtpToken(token)
     }

@@ -1,7 +1,7 @@
 import { buildAuthCookie, buildClearAuthCookie, checkAuth, getAuthPayload, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
 import { getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, clearServersListCache } from '../utils/cache.js';
-import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, maskSecretValue, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SECRET_SETTING_FIELDS, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
+import { clearAppearanceSettingsCache, isMaskedSecretValue, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, maskSecretValue, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SECRET_MASK, SECRET_SETTING_FIELDS, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
 import { normalizePctOrNull } from '../utils/traffic.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
@@ -559,11 +559,13 @@ export function sanitizeAdminSettings(fullSettings = {}) {
     password_configured: Boolean(String(password || '').trim())
   };
   // 凭据字段只回传掩码，并单独给出"是否已配置"标志，
-  // 前端据此显示为已配置状态而不是空。
+  // 前端据此显示为已配置状态而不是空。掩码本身也一并下发，
+  // 前端靠它识别"这个值是掩码，不是真值"。
   for (const field of SECRET_SETTING_FIELDS) {
     sanitized[field] = maskSecretValue(sanitized[field]);
     sanitized[`${field}_configured`] = Boolean(String(fullSettings?.[field] || '').trim());
   }
+  sanitized.secret_mask = SECRET_MASK;
   return sanitized;
 }
 
@@ -722,7 +724,7 @@ async function handleD1UsageAction({ data, sys }) {
   }
 }
 
-async function handleSendTestNotificationAction({ data }) {
+async function handleSendTestNotificationAction({ data, sys }) {
   const {
     tg_bot_token,
     tg_chat_id,
@@ -737,21 +739,26 @@ async function handleSendTestNotificationAction({ data }) {
     notification_language,
     expire_notification_time
   } = data;
-  const webhookEnabled = normalizeBooleanSetting(notification_webhook_enabled) === 'true';
-  if (webhookEnabled) {
-    if (!notification_webhook_url || String(notification_webhook_url).trim().length === 0) {
-      return createBadRequestResponse('notificationWebhookUrlRequired');
+    // 前端拿到的是掩码，不是真值。管理员没有改这一项时用库里的副本；
+    // 改过的话客户端传来的是新值（不是掩码），用那个。
+    const clientToken = String(tg_bot_token || '').trim();
+    const storedToken = String(sys?.tg_bot_token || '').trim();
+    const effectiveToken = isMaskedSecretValue(clientToken) ? storedToken : (clientToken || storedToken);
+    const webhookEnabled = normalizeBooleanSetting(notification_webhook_enabled) === 'true';
+    if (webhookEnabled) {
+      if (!notification_webhook_url || String(notification_webhook_url).trim().length === 0) {
+        return createBadRequestResponse('notificationWebhookUrlRequired');
+      }
+    } else if (isSmtpNotificationTarget(effectiveToken)) {
+      // SMTP 邮件渠道（smtp:// 前缀）视为有效的内置通知目标
+    } else if (!effectiveToken) {
+      return createBadRequestResponse('tgBotTokenRequired');
     }
-  } else if (isSmtpNotificationTarget(tg_bot_token)) {
-    // SMTP 邮件渠道（smtp:// 前缀）视为有效的内置通知目标
-  } else if (!tg_bot_token || tg_bot_token.trim().length === 0) {
-    return createBadRequestResponse('tgBotTokenRequired');
-  }
-  try {
-    const notificationLanguage = normalizeNotificationLanguage(notification_language);
-    const messages = getNotificationMessages({ notification_language: notificationLanguage });
-    const result = await sendNotification({
-      tg_bot_token,
+    try {
+      const notificationLanguage = normalizeNotificationLanguage(notification_language);
+      const messages = getNotificationMessages({ notification_language: notificationLanguage });
+      const result = await sendNotification({
+        tg_bot_token: effectiveToken,
       tg_chat_id: tg_chat_id || '',
       notification_webhook_enabled: normalizeBooleanSetting(notification_webhook_enabled),
       notification_webhook_url: notification_webhook_url || '',

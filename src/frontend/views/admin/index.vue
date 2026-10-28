@@ -1442,6 +1442,7 @@ const loadSettings = async () => {
         turnstile_secret_key: settingsData.turnstile_secret_key || '',
         cloudflare_account_id: settingsData.cloudflare_account_id || '',
         cloudflare_token: settingsData.cloudflare_token || '',
+        secret_mask: settingsData.secret_mask || '',
         jwt_secret: '',
         username: settingsData.username || '',
         password_configured: settingsData.password_configured === true,
