@@ -461,8 +461,10 @@ npx wrangler d1 export server-monitor-db --remote --output=backup-$(date +%F).sq
 ## 8. Tests
 
 ```bash
-npm test          # the node:test suite (26 files)
-npm run test:all  # + agent-config and history-query — run this one
+npm test                  # the node:test suite (26 files)
+npm run test:agent-config # the agent config serialization suite (a plain script)
+npm run test:history-query
+npm run test:all          # all three, chained with &&
 ```
 
 **`npm run test:all` is the gate.** `npm test` alone leaves two suites out: `test/agent-config.js`
@@ -470,6 +472,10 @@ npm run test:all  # + agent-config and history-query — run this one
 serialization and its MD5) and `test/history-query.test.js`. `src/utils/agentConfig.js` is covered
 **only** by the first of those, so a refactor of the config channel can look green under `npm test`
 and still be broken.
+
+The `&&` chain short-circuits on the first failure, and in this environment `npm test` always fails
+on the mkcert test below — so `npm run test:all` never reaches the other two. Until that failure is
+fixed, run `npm run test:agent-config` and `npm run test:history-query` directly.
 
 `test/security-hardening.test.js` covers the patches in §4 and **must stay green**.
 One upstream test (`frontend-live-socket.test.js`) fails in this environment because
