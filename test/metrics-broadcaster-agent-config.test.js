@@ -14,7 +14,7 @@ globalThis.WebSocketRequestResponsePair = class WebSocketRequestResponsePair {
   }
 };
 
-function makeBroadcaster(webSockets = [], env = { DB: {} }) {
+function makeBroadcaster(webSockets = [], env = { DB: {} }, storage = null) {
   const accepted = webSockets;
   return new MetricsBroadcaster({
     setWebSocketAutoResponse() {},
@@ -26,7 +26,7 @@ function makeBroadcaster(webSockets = [], env = { DB: {} }) {
     acceptWebSocket(ws) {
       accepted.push(ws);
     },
-    storage: {
+    storage: storage || {
       async get() {
         return null;
       },
@@ -1598,4 +1598,58 @@ test('WSS history persistence keeps samples received during a D1 flush for the n
   } finally {
     Date.now = originalNow;
   }
+});
+test('the resource alert snapshot is not rewritten on every report when nobody is watching', async () => {
+  // 没有前端订阅是常态：此时必须落盘（否则 DO 休眠会丢掉内存里的采样），
+  // 但绝不能每条上报都把整份快照重写一遍——那是在消息热路径上写存储。
+  const puts = [];
+  const storage = {
+    async get() { return null; },
+    async put(key, value) { puts.push({ key, value }); }
+  };
+  const broadcaster = makeBroadcaster([], { DB: {} }, storage);
+  const now = Date.now();
+  const updates = [{
+    serverId: 'server-snapshot',
+    samples: [{ ts: now, data: { cpu: 10, ram_total: 100, ram_used: 50 } }]
+  }];
+
+  for (let i = 0; i < 5; i++) {
+    await broadcaster._cacheResourceAlertSamples(updates, now + i);
+  }
+
+  assert.equal(
+    puts.length,
+    1,
+    `five reports with no subscriber must not cause five snapshot writes (got ${puts.length})`
+  );
+  assert.ok(
+    puts[0]?.value?.windows?.length > 0,
+    'the samples still reach storage - the throttle must not lose them'
+  );
+});
+
+test('a failed attachment write is not silent and does not break the session', async () => {
+  // 附件有 16 KB 上限，超限时 serializeAttachment 抛错。
+  // 静默吞掉会让采样无声丢失，同一份附件里的会话状态也一起写不进去。
+  const socket = makeHibernationSocket();
+  let attempts = 0;
+  const originalSerialize = socket.serializeAttachment.bind(socket);
+  socket.serializeAttachment = (value) => {
+    attempts++;
+    // 第一次写带着待写入的聚合值：模拟超限抛错。
+    if (attempts === 1 && value?.pendingHistoryAggregate) {
+      throw new Error('attachment exceeds the 16 KB limit');
+    }
+    return originalSerialize(value);
+  };
+
+  const broadcaster = makeBroadcaster([], { DB: {} });
+  broadcaster._saveAgentPendingAggregate(socket, { authenticated: true, serverId: 'server-x' }, { cpu: { sum: 1, count: 1 } });
+
+  assert.ok(attempts >= 2, 'the write is retried without the aggregate');
+  const attachment = socket.deserializeAttachment();
+  assert.equal(attachment.authenticated, true, 'the session state survives the failed write');
+  assert.equal(attachment.pendingHistoryAggregate, null, 'the aggregate is dropped rather than the session');
+  assert.notEqual(socket.closed, true, 'a healthy connection is not dropped');
 });

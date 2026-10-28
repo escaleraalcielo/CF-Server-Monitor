@@ -93,6 +93,9 @@ const RESOURCE_ALERT_MAX_BUCKETS = 10;
 const RESOURCE_ALERT_MAX_SERVERS = 1000;
 const RESOURCE_ALERT_EVALUATE_RULE_BATCH_MAX = 20;
 const RESOURCE_ALERT_SNAPSHOT_INTERVAL_MS = 60 * 1000;
+// 没有前端订阅时的强制落盘间隔：落盘是为了让 DO 休眠后还能拿回采样，
+// 不需要每条上报都写一次，但也不能退回到 60 秒（那正是节流丢掉采样的原因）。
+const RESOURCE_ALERT_FORCE_SAVE_MIN_INTERVAL_MS = 10 * 1000;
 const RESOURCE_ALERT_CACHE_ACTIVE_GRACE_MS = 3 * 60 * 1000;
 const RESOURCE_ALERT_LATEST_TOLERANCE_MS = 2 * 60 * 1000;
 const RESOURCE_ALERT_MIN_SAMPLE_RATIO = 0.4;
@@ -309,6 +312,10 @@ export class MetricsBroadcaster {
     this.resourceAlertWindows = new Map();
     this.resourceAlertSnapshotLoaded = false;
     this.resourceAlertSnapshotDirty = false;
+    // 上次落盘时间。注意这个字段名：之前读写用的是 resourceAlertSnapshotLastSave，
+    // 而构造函数初始化的是 resourceAlertLastSnapshotSave —— 两个名字差一个词序。
+    // 于是 now - undefined 得到 NaN，而 NaN < 间隔 恒为 false，
+    // 60 秒的节流从来没有生效过，每条上报都在重写整份快照。
     this.resourceAlertLastSnapshotSave = 0;
     this.resourceAlertCacheActiveUntil = 0;
     this.resourceAlertCacheStateLoaded = false;
@@ -1300,14 +1307,28 @@ export class MetricsBroadcaster {
 
   _saveAgentPendingAggregate(ws, attachment, pendingAggregate) {
     // 待写入的聚合值写回 socket attachment，保证 DO 休眠后仍能取回。
+    if (!ws || typeof ws.serializeAttachment !== 'function') return;
+    const current = ws.deserializeAttachment() || attachment || {};
     try {
-      if (!ws || typeof ws.serializeAttachment !== 'function') return;
-      const current = ws.deserializeAttachment() || attachment || {};
       ws.serializeAttachment({
         ...current,
         pendingHistoryAggregate: pendingAggregate || null
       });
-    } catch (_) {}
+    } catch (e) {
+      // 附件有 16 KB 上限，超限时 serializeAttachment 会抛错。
+      // 静默吞掉会让这批采样无声丢失，而且同一份附件里的会话状态
+      // （authenticated / serverId）也一起写不进去。
+      console.warn('[update-ws] persist pending aggregate failed:', e?.message || e);
+      // 先退到最小附件：宁可丢掉这批待写入的聚合值，也不要让一次
+      // 写失败把整条连接的认证状态搞坏。
+      try {
+        ws.serializeAttachment({ ...current, pendingHistoryAggregate: null });
+      } catch (_) {
+        // 连最小附件都写不进去，这份 attachment 已经不可信了：
+        // 让 Agent 重连，拿一个干净的 attachment，总比拿着半截状态继续跑好。
+        this._closeWsWithError(ws, 'Attachment too large', 413);
+      }
+    }
   }
 
   async _persistAgentHistoryIfDue(ws, attachment, payload) {
@@ -2058,7 +2079,7 @@ export class MetricsBroadcaster {
   }
 
   // 没有前端订阅时，DO 会在两次上报之间休眠，内存里的采样会随之清空；
-  // 这时必须立刻落盘，否则错开时间上报的服务器会丢掉各自的采样。
+  // 这时必须落盘，否则错开时间上报的服务器会丢掉各自的采样。
   // 有订阅时上报更密集、DO 不会休眠，60 秒的节流就够了。
   _mustFlushResourceAlertSnapshot() {
     return this._getFrontendSubscriberCount() === 0;
@@ -2066,7 +2087,13 @@ export class MetricsBroadcaster {
 
   async _persistResourceAlertSnapshotIfNeeded(now = Date.now(), force = false) {
     if (!this.resourceAlertSnapshotDirty && !force) return;
-    if (!force && now - this.resourceAlertLastSnapshotSave < RESOURCE_ALERT_SNAPSHOT_INTERVAL_MS) return;
+    // 强制落盘也不能每条上报都重写整份快照：没有面板打开是常态，
+    // 那等于在消息热路径上每条上报写一次存储。强制落盘走一个短间隔，
+    // 采样窗口本身是 60 秒，少掉这十秒不影响告警判定。
+    const minInterval = force
+      ? RESOURCE_ALERT_FORCE_SAVE_MIN_INTERVAL_MS
+      : RESOURCE_ALERT_SNAPSHOT_INTERVAL_MS;
+    if (now - this.resourceAlertLastSnapshotSave < minInterval) return;
 
     this._pruneResourceAlertWindows(now);
     const windows = [];
@@ -2076,6 +2103,14 @@ export class MetricsBroadcaster {
         serverId,
         samples: window.samples
       });
+    }
+
+    // 没有可保存的采样时不写存储：空快照写进去没有意义，
+    // 而常态下每条上报都会走到这里。
+    if (windows.length === 0) {
+      this.resourceAlertSnapshotDirty = false;
+      this.resourceAlertLastSnapshotSave = now;
+      return;
     }
 
     try {
