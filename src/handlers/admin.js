@@ -1,11 +1,19 @@
 import { buildAuthCookie, buildClearAuthCookie, checkAuth, getAuthPayload, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
-import { getLatestMetricsForAllServers } from '../database/schema.js';
+import { getLatestMetricsForAllServers, ensureAgentTokenSchema } from '../database/schema.js';
 import { getAllServers, clearServersListCache } from '../utils/cache.js';
 import { clearAppearanceSettingsCache, isMaskedSecretValue, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, maskSecretValue, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SECRET_MASK, SECRET_SETTING_FIELDS, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
 import { readJsonBodyWithLimit } from '../utils/requestBody.js';
 import { normalizePctOrNull } from '../utils/traffic.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
+import {
+  createAgentToken,
+  deleteAgentTokens,
+  getAgentToken,
+  getSharedSecretUsage,
+  listAgentTokens,
+  revokeAgentToken
+} from '../utils/agentTokens.js';
 import { clearLoginFailures, getLoginBackoffMs, registerLoginFailure } from '../utils/loginRateLimit.js';
 import { AppError, createSuccessResponse, createBadRequestResponse, createUnauthorizedResponse, createErrorResponse } from '../utils/errors.js';
 import { addServerColumns } from '../database/updateDatabase.js';
@@ -246,6 +254,8 @@ async function deleteServer(db, id) {
     }
 
     await db.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
+    // 服务器没了，它的节点令牌也不能留着继续用。
+    await deleteAgentTokens(db, id);
   } catch (err) {
     throw err;
   }
@@ -594,6 +604,98 @@ async function handleGetInstallSecretAction({ env }) {
   });
 }
 
+// ── 节点令牌 ───────────────────────────────────────────────
+// 过渡期：每台机器可以有自己的上报令牌，但已部署的 Agent 还只认共享密钥，
+// 所以共享密钥继续可用，同时记录它的使用次数，管理员看着它归零后再退役。
+
+function normalizeAgentTokenServerId(data = {}) {
+  const serverId = String(data.server_id || data.id || '').trim();
+  return isValidUUID(serverId) ? serverId : '';
+}
+
+async function findServerForAgentToken(env, serverId) {
+  const server = await env.DB.prepare('SELECT id FROM servers WHERE id = ?').bind(serverId).first();
+  return server || null;
+}
+
+// 创建节点令牌：明文只在这次响应里出现，之后库里只剩摘要，admin 也取不回来。
+async function handleCreateAgentTokenAction({ env, data }) {
+  const serverId = normalizeAgentTokenServerId(data);
+  if (!serverId) {
+    return createBadRequestResponse('invalidServerId');
+  }
+  if (!await findServerForAgentToken(env, serverId)) {
+    return createBadRequestResponse('serverNotFound');
+  }
+
+  await ensureAgentTokenSchema(env.DB);
+  if (await getAgentToken(env.DB, serverId)) {
+    // 已经有令牌时不覆盖：轮换会让已装好的 Agent 立刻 401，必须显式轮换。
+    return createBadRequestResponse('agentTokenAlreadyExists');
+  }
+
+  const token = await createAgentToken(env.DB, serverId);
+  return createSuccessResponse({
+    success: true,
+    server_id: serverId,
+    agent_token: token.plaintext,
+    token_prefix: token.tokenPrefix,
+    created_at: token.createdAt
+  });
+}
+
+// 轮换节点令牌：旧令牌立刻失效，新令牌明文同样只返回一次。
+async function handleRotateAgentTokenAction({ env, data }) {
+  const serverId = normalizeAgentTokenServerId(data);
+  if (!serverId) {
+    return createBadRequestResponse('invalidServerId');
+  }
+  if (!await findServerForAgentToken(env, serverId)) {
+    return createBadRequestResponse('serverNotFound');
+  }
+
+  await ensureAgentTokenSchema(env.DB);
+  const token = await createAgentToken(env.DB, serverId);
+  return createSuccessResponse({
+    success: true,
+    server_id: serverId,
+    agent_token: token.plaintext,
+    token_prefix: token.tokenPrefix,
+    created_at: token.createdAt
+  });
+}
+
+// 撤销节点令牌：下一次上报立刻 401。
+async function handleRevokeAgentTokenAction({ env, data }) {
+  const serverId = normalizeAgentTokenServerId(data);
+  if (!serverId) {
+    return createBadRequestResponse('invalidServerId');
+  }
+
+  await ensureAgentTokenSchema(env.DB);
+  const revoked = await revokeAgentToken(env.DB, serverId);
+  return createSuccessResponse({
+    success: true,
+    server_id: serverId,
+    revoked
+  });
+}
+
+// 令牌状态 + 共享密钥使用次数。响应里只有摘要前缀和时间，没有任何明文。
+async function handleGetAgentTokenStatusAction({ env }) {
+  await ensureAgentTokenSchema(env.DB);
+  const tokens = await listAgentTokens(env.DB);
+  const usage = await getSharedSecretUsage(env.DB);
+  return createSuccessResponse({
+    success: true,
+    tokens,
+    // 本小时的使用次数：小时一过就归零，归零说明共享密钥已经没人用了。
+    shared_secret_usage_count: usage.count,
+    shared_secret_usage_total: usage.total,
+    shared_secret_usage_last_used_at: usage.lastUsedAt
+  });
+}
+
 async function handleStartThemePreviewAction({ request, data }) {
   const normalizedThemeUrl = normalizeThemeUrl(data.theme_url);
   if (!normalizedThemeUrl) {
@@ -796,6 +898,10 @@ const ADMIN_MAX_REQUEST_BYTES = 512 * 1024;
 const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
   get_settings: handleGetSettingsAction,
   get_install_secret: handleGetInstallSecretAction,
+  create_agent_token: handleCreateAgentTokenAction,
+  rotate_agent_token: handleRotateAgentTokenAction,
+  revoke_agent_token: handleRevokeAgentTokenAction,
+  get_agent_token_status: handleGetAgentTokenStatusAction,
   start_theme_preview: handleStartThemePreviewAction,
   save_theme_options: handleSaveThemeOptionsAction,
   list: handleListAction,

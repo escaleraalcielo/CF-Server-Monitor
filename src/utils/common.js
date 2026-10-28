@@ -122,6 +122,19 @@ export async function timingSafeEqualString(left, right) {
   return timingSafeEqualBytes(new Uint8Array(leftDigest), new Uint8Array(rightDigest));
 }
 
+/**
+ * 计算字符串的 SHA-256 十六进制摘要。
+ * 用于节点令牌这类"高熵随机值"的存储：令牌本身不是口令，
+ * 不需要 PBKDF2 那种慢哈希，只需要"库里存摘要、比对时对摘要做常量时间比较"。
+ * @param {string} value
+ * @returns {Promise<string>} 小写十六进制摘要；非字符串返回空串
+ */
+export async function sha256Hex(value) {
+  if (typeof value !== 'string') return '';
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return bytesToHex(new Uint8Array(digest));
+}
+
 async function derivePbkdf2Hash(password, salt, iterations) {
   const encoder = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey(

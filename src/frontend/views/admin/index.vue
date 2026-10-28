@@ -135,6 +135,53 @@
           @delete="openDeleteModal"
         />
 
+        <div v-if="activeTab === 'servers'" class="main-panel agent-token-panel" style="margin-top: 20px;">
+          <div class="panel-header">
+            <div class="panel-title">$ AGENT TOKENS</div>
+          </div>
+          <div class="alert alert-info alert-stack">
+            <div class="alert-line">
+              Shared secret usage this hour: <strong>{{ sharedSecretUsageCount }}</strong>
+              (total {{ sharedSecretUsageTotal }}).
+              A per-node token is shown once and cannot be retrieved again - rotate it to get a new one.
+            </div>
+          </div>
+          <div class="table-wrapper">
+            <table class="terminal-table">
+              <thead>
+                <tr>
+                  <th>{{ trans.serverName }}</th>
+                  <th>Token</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="server in servers" :key="'agent-token-' + server.id">
+                  <td>{{ server.name || server.id }}</td>
+                  <td>{{ agentTokenStatusText(server.id) }}</td>
+                  <td>
+                    <button class="btn btn-sm" :disabled="agentTokenBusy" @click="createAgentToken(server.id)">Create</button>
+                    <button class="btn btn-sm btn-blue" :disabled="agentTokenBusy" @click="rotateAgentToken(server.id)">Rotate</button>
+                    <button class="btn btn-sm btn-red" :disabled="agentTokenBusy" @click="revokeAgentToken(server.id)">Revoke</button>
+                  </td>
+                </tr>
+                <tr v-if="servers.length === 0">
+                  <td colspan="3" class="empty-state">{{ trans.noServers }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-if="agentTokenPlaintext" class="alert alert-info alert-stack">
+            <div class="alert-line">
+              New token for {{ servers.find(s => s.id === agentTokenPlaintextServerId)?.name || agentTokenPlaintextServerId }}:
+              <code>{{ agentTokenPlaintext }}</code>
+            </div>
+            <button class="btn btn-sm" @click="copyAgentTokenPlaintext">
+              {{ agentTokenCopied ? '✓' : trans.copy }}
+            </button>
+          </div>
+        </div>
+
         <SettingsPanel
           ref="settingsPanelRef"
           :trans="trans"
@@ -622,6 +669,7 @@ import { FRONTEND_WS_TIMEOUT_MINUTES_MAX, HISTORY, STORAGE } from '../../utils/c
 import { usePasswordVisibility } from '../../composables/usePasswordVisibility'
 import { useTurnstile } from './composables/useTurnstile'
 import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../../utils/server.js'
+import { resolveAgentInstallSecret } from '../../../utils/agentTokens.js'
 
 const trans = useTranslation()
 const route = useRoute()
@@ -1001,7 +1049,24 @@ const settings = ref({
   csp_static: '',
   csp_api: ''
 })
+// apiSecret 是"当前安装命令要写进 -secret 的那个密钥"：
+// 节点自己有令牌时是那个令牌，没有才退回共享密钥。
 const apiSecret = ref('')
+// 共享密钥只在打开安装命令面板时按需取，取完随面板关闭丢弃。
+const sharedApiSecret = ref('')
+// 节点令牌的明文只在创建/轮换时拿得到，留在本页内存里供安装命令使用。
+const agentTokenSecrets = ref({})
+// 每个节点的令牌状态（有没有令牌、前缀、最后使用时间），不含明文。
+const agentTokenStatus = ref({})
+// 刚生成的令牌明文，只显示这一次。
+const agentTokenPlaintext = ref('')
+const agentTokenPlaintextServerId = ref('')
+const agentTokenCopied = ref(false)
+const agentTokenBusy = ref(false)
+const sharedSecretUsageCount = ref(0)
+const sharedSecretUsageTotal = ref(0)
+// 当前安装命令针对哪台机器；空字符串表示自动发现（只能用共享密钥）。
+const installSecretTargetId = ref('')
 const cacheRefreshing = ref(false)
 const savedAutoDiscovery = ref(false)
 const changeAdminPassword = ref(false)
@@ -1323,7 +1388,8 @@ const initAdmin = async () => {
     await Promise.all([
       loadSettings(),
       loadServers(),
-      loadLatestAgentVersion()
+      loadLatestAgentVersion(),
+      loadAgentTokenStatus()
     ])
   } else {
     await loadTurnstileConfig()
@@ -1352,6 +1418,14 @@ const resetAdminContext = () => {
   showCopyModal.value = false
   showDbModal.value = false
   validationError.value = null
+  // 换站点或退出登录时把本页留着的令牌明文一起丢掉。
+  agentTokenSecrets.value = {}
+  agentTokenStatus.value = {}
+  agentTokenPlaintext.value = ''
+  agentTokenPlaintextServerId.value = ''
+  sharedSecretUsageCount.value = 0
+  sharedSecretUsageTotal.value = 0
+  installSecretTargetId.value = ''
 }
 
 const switchAdminSite = async () => {
@@ -1465,6 +1539,7 @@ const loadSettings = async () => {
       applyMikusThemeOptions(settingsData.theme_options)
       changeAdminPassword.value = !settings.value.password_configured || !String(settings.value.username || '').trim()
       // 上报密钥（api_secret）不再随设置一起下发；打开安装命令面板时按需获取。
+      sharedApiSecret.value = ''
       apiSecret.value = ''
       // 只有已保存到服务端的自动发现开关才提供复制安装命令，避免复制出当前并未生效的命令
       savedAutoDiscovery.value = settings.value.auto_discovery
@@ -1760,19 +1835,168 @@ const addServer = async () => {
 // 上报密钥按需获取：只有管理员打开安装命令面板时才向服务端要，
 // 面板关闭后立刻丢弃。常规设置响应里不再携带这个共享密钥。
 const fetchInstallSecret = async () => {
-  if (apiSecret.value) return apiSecret.value
-  try {
-    const result = await adminApiForSite({ action: 'get_install_secret' })
-    if (result.error) return ''
-    apiSecret.value = result.data?.api_secret || ''
-    return apiSecret.value
-  } catch (_) {
-    return ''
+  if (!sharedApiSecret.value) {
+    try {
+      const result = await adminApiForSite({ action: 'get_install_secret' })
+      if (!result.error) {
+        sharedApiSecret.value = result.data?.api_secret || ''
+      }
+    } catch (_) {
+      // 拿不到共享密钥时下面会解析出空值，调用方会拒绝生成命令
+    }
   }
+  return resolveInstallSecret()
 }
 
 const clearInstallSecret = () => {
+  sharedApiSecret.value = ''
   apiSecret.value = ''
+}
+
+// 安装命令该写哪个密钥：节点自己有令牌就写那个令牌，没有才退回共享密钥。
+// 节点已经有令牌但明文取不回来时返回空串，宁可不生成命令也不写空密钥。
+const resolveInstallSecret = () => {
+  const serverId = installSecretTargetId.value
+  const nodeToken = serverId ? (agentTokenSecrets.value[serverId] || '') : ''
+  const hasNodeToken = serverId ? Boolean(agentTokenStatus.value[serverId]?.has_token) : false
+  apiSecret.value = resolveAgentInstallSecret({
+    nodeToken,
+    hasNodeToken,
+    sharedSecret: sharedApiSecret.value
+  })
+  return apiSecret.value
+}
+
+// 节点令牌状态 + 共享密钥使用次数。只有元信息，没有明文。
+const loadAgentTokenStatus = async () => {
+  try {
+    const result = await adminApiForSite({ action: 'get_agent_token_status' })
+    if (result.error) return
+    const status = {}
+    for (const item of result.data?.tokens || []) {
+      status[item.server_id] = {
+        has_token: true,
+        token_prefix: item.token_prefix || '',
+        created_at: Number(item.created_at || 0),
+        last_used_at: Number(item.last_used_at || 0)
+      }
+    }
+    agentTokenStatus.value = status
+    sharedSecretUsageCount.value = Number(result.data?.shared_secret_usage_count || 0) || 0
+    sharedSecretUsageTotal.value = Number(result.data?.shared_secret_usage_total || 0) || 0
+  } catch (e) {
+    console.error('[ERROR] Load agent token status failed:', e)
+  }
+}
+
+const agentTokenStatusText = (serverId) => {
+  const status = agentTokenStatus.value[serverId]
+  if (!status?.has_token) return 'No token'
+  const prefix = status.token_prefix ? ` ${status.token_prefix}...` : ''
+  // 明文不在本页内存里时说明是刷新页面后重新进来的，只能轮换一个。
+  return agentTokenSecrets.value[serverId]
+    ? `Token${prefix}`
+    : `Token${prefix} (rotate to get the secret)`
+}
+
+// 明文只在创建/轮换的响应里出现一次，存进本页内存供安装命令使用。
+const applyAgentTokenResponse = (serverId, data) => {
+  const plaintext = data?.agent_token || ''
+  if (!plaintext) return
+  agentTokenSecrets.value = { ...agentTokenSecrets.value, [serverId]: plaintext }
+  agentTokenStatus.value = {
+    ...agentTokenStatus.value,
+    [serverId]: { has_token: true, token_prefix: data.token_prefix || '' }
+  }
+  agentTokenPlaintext.value = plaintext
+  agentTokenPlaintextServerId.value = serverId
+  resolveInstallSecret()
+}
+
+// 令牌相关的错误码暂时没有对应的多语言文案，这里给出可读的英文提示。
+const agentTokenErrorText = (code) => {
+  if (code === 'serverNotFound') return 'Server not found'
+  if (code === 'agentTokenAlreadyExists') return 'This server already has a token - rotate it instead'
+  if (code === 'invalidServerId') return 'Invalid server ID'
+  return getMessage(code) || code || trans.value.operationFailed
+}
+
+const createAgentToken = async (serverId) => {
+  if (agentTokenBusy.value) return
+  agentTokenBusy.value = true
+  try {
+    const result = await adminApiForSite({ action: 'create_agent_token', server_id: serverId })
+    if (result.error) {
+      alertMessage.value = agentTokenErrorText(result.error)
+      return
+    }
+    applyAgentTokenResponse(serverId, result.data)
+    await loadAgentTokenStatus()
+  } catch (e) {
+    alertMessage.value = e.message
+  } finally {
+    agentTokenBusy.value = false
+  }
+}
+
+const rotateAgentToken = async (serverId) => {
+  if (agentTokenBusy.value) return
+  agentTokenBusy.value = true
+  try {
+    const result = await adminApiForSite({ action: 'rotate_agent_token', server_id: serverId })
+    if (result.error) {
+      alertMessage.value = agentTokenErrorText(result.error)
+      return
+    }
+    applyAgentTokenResponse(serverId, result.data)
+    await loadAgentTokenStatus()
+  } catch (e) {
+    alertMessage.value = e.message
+  } finally {
+    agentTokenBusy.value = false
+  }
+}
+
+const revokeAgentToken = async (serverId) => {
+  if (agentTokenBusy.value) return
+  agentTokenBusy.value = true
+  try {
+    const result = await adminApiForSite({ action: 'revoke_agent_token', server_id: serverId })
+    if (result.error) {
+      alertMessage.value = agentTokenErrorText(result.error)
+      return
+    }
+    const secrets = { ...agentTokenSecrets.value }
+    delete secrets[serverId]
+    agentTokenSecrets.value = secrets
+    agentTokenStatus.value = {
+      ...agentTokenStatus.value,
+      [serverId]: { has_token: false }
+    }
+    if (agentTokenPlaintextServerId.value === serverId) {
+      agentTokenPlaintext.value = ''
+      agentTokenPlaintextServerId.value = ''
+    }
+    resolveInstallSecret()
+    await loadAgentTokenStatus()
+  } catch (e) {
+    alertMessage.value = e.message
+  } finally {
+    agentTokenBusy.value = false
+  }
+}
+
+const copyAgentTokenPlaintext = async () => {
+  if (!agentTokenPlaintext.value) return
+  const copied = await copyTextToClipboard(agentTokenPlaintext.value)
+  if (!copied) {
+    alertMessage.value = trans.value.httpsRequired
+    return
+  }
+  agentTokenCopied.value = true
+  setTimeout(() => {
+    agentTokenCopied.value = false
+  }, 1500)
 }
 
 const resolveServerPingNode = (server, field) => {
@@ -1812,6 +2036,8 @@ const getUninstallCommand = () => {
 const copyCmd = async (serverId) => {
   const server = servers.value.find(s => s.id === serverId)
   copyServerId.value = serverId
+  // 先定下这次安装命令针对哪台机器：它有自己的令牌就用那个。
+  installSecretTargetId.value = serverId
   currentServerName.value = server?.name || ''
   targetOs.value = 'linux'
   installMode.value = 'current-user'
@@ -2038,12 +2264,15 @@ const openAutoDiscoveryModal = async () => {
 
   autoDiscoveryCopied.value = false
   // 同样先取密钥再开面板，避免复制到 -secret='' 的坏命令。
+  // 自动发现没有具体机器，只能用共享密钥。
+  installSecretTargetId.value = ''
   await fetchInstallSecret()
   showAutoDiscoveryModal.value = true
 }
 
 const closeAutoDiscoveryModal = () => {
   showAutoDiscoveryModal.value = false
+  installSecretTargetId.value = ''
   clearInstallSecret()
 }
 
@@ -2098,6 +2327,7 @@ const copyCustomCmd = async () => {
 
 const closeCopyModal = () => {
   showCopyModal.value = false
+  installSecretTargetId.value = ''
   clearInstallSecret()
 }
 
@@ -2105,6 +2335,7 @@ const openEditModalFromCopy = () => {
   const server = servers.value.find(s => s.id === copyServerId.value)
   if (server) {
     showCopyModal.value = false
+    installSecretTargetId.value = ''
     clearInstallSecret()
     openEditModal(server)
   }
