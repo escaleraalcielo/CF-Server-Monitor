@@ -14,7 +14,15 @@ function bodyOf(name) {
   const start = source.indexOf(`const ${name} = `);
   assert.notEqual(start, -1, `${name} not found`);
   const next = source.indexOf('\nconst ', start + 1);
-  return source.slice(start, next === -1 ? source.length : next);
+  return stripComments(source.slice(start, next === -1 ? source.length : next));
+}
+
+// Comments mention -secret='' when explaining the guard; they are not
+// arguments. Strip them before scanning for secret arguments.
+function stripComments(text) {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
 }
 
 test('the install-command builders refuse to run without the ingest secret', () => {
@@ -61,6 +69,26 @@ test('the ingest secret is dropped whenever the install dialog is left', () => {
       body.includes('clearInstallSecret()'),
       `${closer} must clear the ingest secret`
     );
+  }
+});
+
+test('the install commands do embed the ingest secret', () => {
+  // The guard above makes the builders refuse to run without a secret; this
+  // asserts the other half - that when they do run, every secret argument
+  // they hand to the agent actually carries the secret. Checking "some
+  // argument mentions it" would be too weak: the builders emit one
+  // argument per platform, and dropping the secret from just one of them
+  // would still leave the others matching.
+  for (const builder of ['getCustomInstallCommand', 'buildAutoDiscoveryCommand']) {
+    const body = bodyOf(builder);
+    const args = [...body.matchAll(/(-secret=|SECRET=)([^,\n]*)/g)];
+    assert.ok(args.length > 0, `${builder} must pass a secret argument to the agent`);
+    for (const [, label, value] of args) {
+      assert.ok(
+        value.includes('apiSecret.value'),
+        `${builder}: every ${label} argument must carry the ingest secret, got "${value.trim()}"`
+      );
+    }
   }
 });
 
