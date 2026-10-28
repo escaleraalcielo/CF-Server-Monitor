@@ -73,6 +73,11 @@ async function configRequest(origin) {
 test('a turnstile-verified response does not reflect a foreign origin', async () => {
   const response = await configRequest(FOREIGN_ORIGIN);
 
+  // If the turnstile gate had not run, this request would have taken the same
+  // path as any other response and the assertions below would prove nothing.
+  const body = await response.clone().json();
+  assert.ok(body?.turnstile_verified, 'the turnstile gate must have run');
+
   assert.equal(
     response.headers.get('Access-Control-Allow-Origin'),
     null,
@@ -87,6 +92,9 @@ test('a turnstile-verified response does not reflect a foreign origin', async ()
 
 test('a turnstile-verified response still allows a configured origin', async () => {
   const response = await configRequest(ALLOWED_ORIGIN);
+
+  const body = await response.clone().json();
+  assert.ok(body?.turnstile_verified, 'the turnstile gate must have run');
 
   assert.equal(response.headers.get('Access-Control-Allow-Origin'), ALLOWED_ORIGIN);
   assert.equal(response.headers.get('Access-Control-Allow-Credentials'), 'true');
