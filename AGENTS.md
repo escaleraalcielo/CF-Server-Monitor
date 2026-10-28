@@ -461,11 +461,18 @@ npx wrangler d1 export server-monitor-db --remote --output=backup-$(date +%F).sq
 ## 8. Tests
 
 ```bash
-npm test          # full suite
-npm run test:all  # + agent-config and history-query suites
+npm test          # the node:test suite (26 files)
+npm run test:all  # + agent-config and history-query — run this one
 ```
+
+**`npm run test:all` is the gate.** `npm test` alone leaves two suites out: `test/agent-config.js`
+(runs as a plain script, `node test/agent-config.js` — it is the suite that pins the agent config
+serialization and its MD5) and `test/history-query.test.js`. `src/utils/agentConfig.js` is covered
+**only** by the first of those, so a refactor of the config channel can look green under `npm test`
+and still be broken.
 
 `test/security-hardening.test.js` covers the patches in §4 and **must stay green**.
 One upstream test (`frontend-live-socket.test.js`) fails in this environment because
 `vite-plugin-mkcert` needs an interactive `sudo` to install a CA — unrelated to any
-change in this clone.
+change in this clone. It fails identically on the base commit, so compare against the
+base before blaming a change.
