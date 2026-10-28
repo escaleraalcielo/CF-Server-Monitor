@@ -287,7 +287,19 @@ export default {
         try {
           const id = env.METRICS_BROADCASTER.idFromName('global');
           const stub = env.METRICS_BROADCASTER.get(id);
-          return await stub.fetch('http://internal/health');
+          const response = await stub.fetch('http://internal/health');
+          // DO 的 /health 会带上订阅数、连接数这些运行指标。
+          // 这个入口是未认证可达的，所以只把"活着没有"透出去，
+          // 指标本身要管理员会话才给。
+          const isAdmin = await checkAuth(request, env, sys);
+          if (!isAdmin) {
+            try {
+              await response.body?.cancel();
+            } catch (_) {
+            }
+            return createSuccessResponse({ ok: response.ok });
+          }
+          return response;
         } catch (e) {
           return createSuccessResponse({ ok: false, reason: e.message });
         }

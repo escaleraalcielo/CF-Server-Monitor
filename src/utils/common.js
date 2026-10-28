@@ -46,7 +46,10 @@ export async function verifyTurnstileToken(token, secretKey) {
  * 管理后台密码哈希参数
  */
 export const PASSWORD_HASH_ALGORITHM = 'pbkdf2_sha256';
-export const PASSWORD_HASH_ITERATIONS = 50000;
+// OWASP 对 PBKDF2-HMAC-SHA256 的建议强度。旧的哈希把迭代次数写在哈希串里
+// （pbkdf2_sha256$<iterations>$<salt>$<hash>），所以提高这个值不会让
+// 已存的密码失效——旧哈希照常校验通过，并在下次成功登录时自动升级。
+export const PASSWORD_HASH_ITERATIONS = 600000;
 const PASSWORD_SALT_BYTES = 16;
 const PASSWORD_HASH_BYTES = 32;
 
@@ -174,9 +177,13 @@ export async function verifyPasswordHash(password, storedHash) {
   const parsed = parsePbkdf2Hash(storedHash);
   if (parsed) {
     const hash = await derivePbkdf2Hash(password, parsed.salt, parsed.iterations);
+    const valid = timingSafeEqualBytes(hash, parsed.hash);
     return {
-      valid: timingSafeEqualBytes(hash, parsed.hash),
-      needsRehash: false,
+      valid,
+      // 强度不够的哈希（迭代次数低于当前标准）标记为需要升级：
+      // 登录成功后用新参数重新哈希一次。语义与 MD5 分支一致——
+      // 只有校验通过时才值得重写，校验失败时不该动库里的哈希。
+      needsRehash: valid && parsed.iterations < PASSWORD_HASH_ITERATIONS,
       algorithm: PASSWORD_HASH_ALGORITHM
     };
   }

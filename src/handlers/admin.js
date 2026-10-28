@@ -3,6 +3,7 @@ import { getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, clearServersListCache } from '../utils/cache.js';
 import { clearAppearanceSettingsCache, isMaskedSecretValue, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, maskSecretValue, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SECRET_MASK, SECRET_SETTING_FIELDS, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
+import { readJsonBodyWithLimit } from '../utils/requestBody.js';
 import { normalizePctOrNull } from '../utils/traffic.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
 import { clearLoginFailures, getLoginBackoffMs, registerLoginFailure } from '../utils/loginRateLimit.js';
@@ -788,6 +789,10 @@ async function handleSendTestNotificationAction({ data, sys }) {
   }
 }
 
+// 后台请求体上限。保存设置、导入服务器等 payload 都在几十 KB 量级，
+// 512 KB 足够宽松，同时挡住超大 body 造成的解析开销。
+const ADMIN_MAX_REQUEST_BYTES = 512 * 1024;
+
 const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
   get_settings: handleGetSettingsAction,
   get_install_secret: handleGetInstallSecretAction,
@@ -800,7 +805,26 @@ const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
 
 export async function handleAdminAPI(request, env, sys, loadFullSettings = null, ctx = null) {
   try {
-    const data = await request.json();
+    // 后台接口的 action 在 body 里，所以没法像 /update 那样先鉴权再解析。
+    // 但仍然可以在解析之前限制 body 大小：否则一个未认证的请求只要带一个
+    // 超大 body，就能逼 Worker 把它解析一遍，白白吃掉 CPU。
+    // 限制按实际读取的字节数算，不依赖 Content-Length（chunked 请求可以伪造它）。
+    const parsed = await readJsonBodyWithLimit(request, ADMIN_MAX_REQUEST_BYTES);
+    if (!parsed.ok) {
+      if (parsed.reason === 'too_large') {
+        console.warn('[Admin] 413 Payload too large:', { limit: ADMIN_MAX_REQUEST_BYTES });
+        return new Response(JSON.stringify({
+          error: 'Payload too large',
+          code: 413,
+          text: 'payload_too_large'
+        }), {
+          status: 413,
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+        });
+      }
+      return createBadRequestResponse('invalidRequestBody');
+    }
+    const data = parsed.data || {};
 
     const publicActionHandler = PUBLIC_ADMIN_ACTION_HANDLERS[data.action];
     if (publicActionHandler) {

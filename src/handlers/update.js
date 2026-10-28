@@ -9,6 +9,7 @@ import {
 } from '../utils/metrics.js';
 import { createErrorResponse, createUnauthorizedResponse, createBadRequestResponse } from '../utils/errors.js';
 import { timingSafeEqualString } from '../utils/common.js';
+import { getDeclaredContentLength, readBodyWithLimit } from '../utils/requestBody.js';
 import { ensureServerOptimization } from '../database/indexOptimization.js';
 import { getResourceAlertConfig, getWssReportScheduleState, isWssReportConfigured, loadSiteSettings, normalizeBooleanSetting } from '../utils/settings.js';
 import { cacheLatestReportUpdate } from '../utils/latestReportCache.js';
@@ -89,49 +90,6 @@ export function normalizeAgentVersion(value) {
 
 function logUpdateBadRequest(reason, details = {}) {
   console.warn('[Update] 400 Bad Request:', reason, details);
-}
-
-function getDeclaredContentLength(request) {
-  const raw = request.headers.get('Content-Length');
-  if (!raw) return null;
-  const length = Number(raw);
-  return Number.isFinite(length) && length >= 0 ? length : null;
-}
-
-/**
- * 按实际读取字节数限制请求体大小。
- * 不依赖 Content-Length（chunked 请求可伪造或缺失该头），
- * 超过上限立即中断读取并返回 null，避免解析超大 body 耗尽 Worker CPU。
- * @param {Request} request
- * @param {number} limit 最大字节数
- * @returns {Promise<string|null>} body 文本；超限返回 null
- */
-async function readBodyWithLimit(request, limit) {
-  if (!request.body) {
-    return '';
-  }
-
-  const reader = request.body.getReader();
-  const decoder = new TextDecoder();
-  let received = 0;
-  let text = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    received += value.byteLength;
-    if (received > limit) {
-      try {
-        await reader.cancel();
-      } catch (_) {
-      }
-      return null;
-    }
-    text += decoder.decode(value, { stream: true });
-  }
-
-  text += decoder.decode();
-  return text;
 }
 
 function createPayloadTooLargeResponse() {
