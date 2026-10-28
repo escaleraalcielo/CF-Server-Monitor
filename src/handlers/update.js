@@ -8,7 +8,6 @@ import {
   coerceNumericMetricFields
 } from '../utils/metrics.js';
 import { createErrorResponse, createUnauthorizedResponse, createBadRequestResponse } from '../utils/errors.js';
-import { timingSafeEqualString } from '../utils/common.js';
 import { getDeclaredContentLength, readBodyWithLimit } from '../utils/requestBody.js';
 import { ensureServerOptimization } from '../database/indexOptimization.js';
 import { getResourceAlertConfig, getWssReportScheduleState, isWssReportConfigured, loadSiteSettings, normalizeBooleanSetting } from '../utils/settings.js';
@@ -38,6 +37,10 @@ import {
   discoverServer,
   isAutoDiscoveryEnabled
 } from '../utils/autoDiscovery.js';
+import {
+  AGENT_CREDENTIAL_NODE,
+  authenticateAgentCredential
+} from '../utils/agentTokens.js';
 import {
   UPDATE_FRONTEND_SUBSCRIBER_CHECK_INTERVAL_MS,
   UPDATE_MAX_BATCH_SAMPLES,
@@ -586,11 +589,14 @@ export async function handleUpdate(request, env, ctx) {
 
 async function handleUpdateCore(request, env, ctx, discovery) {
   try {
-    // 认证前置：优先读取请求头中的密钥，在解析 body 之前完成鉴权，
+    // 认证前置：优先读取请求头中的凭据，在解析 body 之前完成鉴权，
     // 避免未认证请求通过超大 body 消耗 Worker CPU。
+    // 凭据可以是共享密钥 env.API_SECRET，也可以是某个节点自己的令牌。
     const headerSecret = request.headers.get('X-API-Secret');
+    let credential = null;
     if (headerSecret !== null) {
-      if (!await timingSafeEqualString(headerSecret, env.API_SECRET)) {
+      credential = await authenticateAgentCredential(env.DB, headerSecret, env.API_SECRET, { ctx });
+      if (!credential.ok) {
         return createUnauthorizedResponse('Invalid secret');
       }
     }
@@ -632,9 +638,10 @@ async function handleUpdateCore(request, env, ctx, discovery) {
 
     const { id: requestedId, secret } = data || {};
 
-    // 请求头未携带密钥时回退到 body 字段（兼容旧版 Agent）。
+    // 请求头未携带凭据时回退到 body 字段（兼容旧版 Agent）。
     if (headerSecret === null) {
-      if (!await timingSafeEqualString(secret, env.API_SECRET)) {
+      credential = await authenticateAgentCredential(env.DB, secret, env.API_SECRET, { ctx });
+      if (!credential.ok) {
         return createUnauthorizedResponse('Invalid secret');
       }
     }
@@ -643,12 +650,25 @@ async function handleUpdateCore(request, env, ctx, discovery) {
     const agentVersion = normalizeAgentVersion(request.headers.get('X-Agent-Version'));
 
     const normalizedRequestId = typeof requestedId === 'string' ? requestedId.trim() : '';
-    let serverDetail = normalizedRequestId
-      ? await getServerDetail(env.DB, normalizedRequestId, true)
+
+    // 节点令牌只认它自己那台机器：拿 A 的令牌报 B 直接 401，
+    // 不给"这台机器存不存在"留出可区分的信号。
+    if (credential?.kind === AGENT_CREDENTIAL_NODE && normalizedRequestId && normalizedRequestId !== credential.serverId) {
+      return createUnauthorizedResponse('Invalid secret');
+    }
+
+    // 节点令牌本身就指明了是哪台机器，没带 id 时用它补上，
+    // 这样节点令牌不会走到自动建号那条路径。
+    const effectiveRequestId = credential?.kind === AGENT_CREDENTIAL_NODE && !normalizedRequestId
+      ? credential.serverId
+      : normalizedRequestId;
+
+    let serverDetail = effectiveRequestId
+      ? await getServerDetail(env.DB, effectiveRequestId, true)
       : null;
 
     // 仅在 id 为空时尝试自动建号：已有 id 但查不到仍走 404，避免删除后被自动复活。
-    if (!serverDetail && !normalizedRequestId) {
+    if (!serverDetail && !effectiveRequestId) {
       // 建号前先做与服务器无关的载荷校验：否则会先 INSERT 出一行空壳，
       // 随后返回 400，库里留下一条永远不会被写入数据的服务器。
       if (normalizeMetricSamples(data).length === 0) {

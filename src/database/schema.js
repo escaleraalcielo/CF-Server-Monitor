@@ -46,6 +46,33 @@ export function clearDashboardLatencyHistoryCache() {
   dashboardLatencyHistoryCache.clear();
 }
 
+// 节点令牌表：一台机器一条记录，只存 SHA-256 摘要，不存明文。
+// token_prefix 是摘要的前 16 位十六进制，用作按前缀检索的索引桶；
+// 真正是否匹配由常量时间比较摘要决定。
+const AGENT_TOKEN_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS agent_tokens (
+    server_id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL,
+    token_prefix TEXT NOT NULL,
+    created_at INTEGER DEFAULT 0,
+    rotated_at INTEGER DEFAULT 0,
+    last_used_at INTEGER DEFAULT 0
+  )
+`;
+
+const AGENT_TOKEN_INDEX_SQL = `
+  CREATE INDEX IF NOT EXISTS idx_agent_tokens_prefix ON agent_tokens (token_prefix)
+`;
+
+/**
+ * 确保节点令牌表存在。存量部署没有这张表时补建，
+ * 新装和补建之后结构完全一致。
+ */
+export async function ensureAgentTokenSchema(db) {
+  await db.prepare(AGENT_TOKEN_TABLE_SQL).run();
+  await db.prepare(AGENT_TOKEN_INDEX_SQL).run();
+}
+
 export async function initDatabase(db) {
   if (dbInitialized) return;
 
@@ -119,6 +146,9 @@ export async function initDatabase(db) {
 
     // 确保 metrics_history 表存在（主键 id 已编码分区与时间，无需二级索引）
     await db.prepare(createHistoryTableSql('metrics_history')).run();
+
+    // 节点令牌表：新装和存量部署都要有同一份结构，CREATE TABLE IF NOT EXISTS 幂等
+    await ensureAgentTokenSchema(db);
 
     debug('✅ 数据库初始化完成');
     dbInitialized = true;

@@ -197,6 +197,50 @@ local clone** — keep these when pulling upstream changes:
 | `src/handlers/admin.js` + `src/utils/loginRateLimit.js` | Per-client exponential backoff on failed logins (Turnstile is **not** available on this account — widget creation returns error 7003). |
 | `src/durable/MetricsBroadcaster.js` | Constant-time `API_SECRET` comparison on the agent WebSocket path. |
 
+### Per-node agent tokens (transition window)
+
+Each monitored server can now have **its own** upload credential instead of sharing
+`API_SECRET`. Ingest accepts **either**:
+
+- the shared `API_SECRET` (what the four deployed agents still know), or
+- that server's own token (`cfsat_…`).
+
+| Piece | Where |
+|---|---|
+| Storage (`agent_tokens`, SHA-256 digest only) | `src/database/schema.js` → `ensureAgentTokenSchema` |
+| Token logic (`generate` / `authenticate` / `revoke` / usage counter) | `src/utils/agentTokens.js` |
+| HTTP ingest (header `X-API-Secret`, body `secret`) | `src/handlers/update.js` → `authenticateAgentCredential` |
+| Admin actions | `src/handlers/admin.js` → `create_agent_token` / `rotate_agent_token` / `revoke_agent_token` / `get_agent_token_status` |
+| Install command embeds the node token | `src/frontend/views/admin/index.vue` → `resolveAgentInstallSecret` |
+
+Rules that must keep holding:
+
+- The **plaintext** token is returned exactly once (create/rotate response) and is
+  never retrievable again — the database only holds `sha256(token)`.
+- Comparison is constant-time (`timingSafeEqualString`); never `===` / `!==` on a secret.
+- A node token authenticates **one** server: presenting node A's token for server B is 401.
+- Revoking is immediate — there is no token cache on the ingest path.
+
+**Shared-secret usage counter.** `settings` key `api_secret_usage` holds
+`{ total, hour, hour_count, last_used_at }`. `hour_count` counts uses in the current
+UTC hour and **falls back to 0** once the hour rolls over, so an operator can watch it
+reach zero and then retire the shared secret. `get_agent_token_status` returns
+`shared_secret_usage_count` (this hour), `shared_secret_usage_total` and
+`shared_secret_usage_last_used_at`; every shared-secret report also logs the count.
+
+> **The counter only covers the HTTP ingest path.** The agent WebSocket path
+> (`src/durable/MetricsBroadcaster.js:706`) still compares against `API_SECRET`
+> directly and does not accept node tokens yet — that file was out of scope for this
+> change. Until it is updated, agents reporting over WSS keep using the shared secret
+> **without being counted**, so do **not** retire `API_SECRET` on the counter alone.
+> The needed change there is to call `authenticateAgentCredential(this.env.DB, data.secret,
+> this.env.API_SECRET)` instead of `timingSafeEqualString(...)`, and to reject a node
+> token whose `serverId` differs from the reported one.
+
+> Migrating a host to its own token means re-provisioning it: `cf-probe install -id=<UUID>
+> -secret='<node token>' …`, then restart `cf-probe.service`. The node token plaintext is
+> only shown once, so copy it at creation time — it cannot be read back from the panel.
+
 ### Live configuration
 - `is_public = 'false'` — the dashboard API requires a session; the site is not public.
 - Admin credentials are **separate** from `API_SECRET` (username `daniel`).
@@ -208,9 +252,11 @@ local clone** — keep these when pulling upstream changes:
   without an Access session.
 
 ### Accepted residual risk
-- **One shared `API_SECRET` for all agents.** Any compromised agent host can write
-  metrics for any server and can reset traffic-correction state. Mitigated by
-  per-host file permissions (0600) and the Access gate, not eliminated.
+- **One shared `API_SECRET` for all agents** — being phased out. Per-node tokens exist
+  now (see *Per-node agent tokens* above), but the shared secret still authenticates
+  every report and is still present in each host's `config.conf` until every agent is
+  re-provisioned. Until then, any compromised agent host can still write metrics for any
+  server and can reset traffic-correction state.
 - The panel still serves a third-party GitHub theme and `custom_script` at panel
   origin. Both are admin-only settings — do not enable them casually.
 - PBKDF2 iteration count is upstream's 50 000 (guidance suggests ≥600 000).
@@ -301,7 +347,8 @@ grep 'dist/cf-probe-linux-amd64$' checksums.txt | sed 's|dist/||' | sha256sum -c
 ## 6. Adding more servers
 
 1. Admin panel → **+ ADD SERVER** (name, group, region). Record the UUID.
-2. On the target host, install the agent with that UUID and the same `API_SECRET`.
+2. On the target host, install the agent with that UUID and the same `API_SECRET`
+   (or with the server's own node token — see *Per-node agent tokens* above).
 3. Confirm it appears ONLINE in the dashboard.
 
 The UUID is required — auto-discovery is disabled. Enabling it would let any host
