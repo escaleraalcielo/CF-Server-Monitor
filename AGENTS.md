@@ -78,6 +78,41 @@ Two things worth keeping straight:
 > A hash below the current count is only flagged for a rewrite when the password was
 > **correct** — matching the legacy-MD5 branch — so a failed login never rewrites the row.
 
+### The public payload is an allowlist, not a denylist
+
+Unauthenticated responses are built by `toPublicServer()` in `src/utils/publicPayload.js`,
+which starts from an **empty object** and copies only the fields named in
+`PUBLIC_SERVER_FIELDS`. A field added to the `servers` table later is therefore private by
+default, instead of being published until somebody remembers to delete it.
+
+- The machine hostname, the private note, tags, price/billing/expiry, the server id, the agent
+  configuration and the traffic corrections are never public.
+- `ip_v4` / `ip_v6` appear only as a reachability flag (`'1'` / `'0'`).
+- A server the operator marked private does not appear in the public list at all.
+- The live-update frames in a public response carry no `serverId`.
+
+The authenticated admin view is unaffected: it still returns every field.
+
+`test/public-payload.test.js` seeds a row whose private fields contain a marker string and
+asserts that the marker appears in no public response body.
+
+### The agent config channel has one source of truth
+
+`src/utils/agentConfig.js` defines `AGENT_CONFIG_FIELD_SPECS`: an ordered list where each
+entry names one key, the minimum negotiated schema version that may receive it, and how its
+value is resolved. `buildAgentConfig()` walks that list to assemble the payload, and
+`serializeAgentConfig()` walks the same list to render the body whose MD5 the agent
+verifies — so the two can never diverge, and a key cannot be added to one and forgotten in
+the other.
+
+Only inert configuration is on that list. It never contains an update trigger (`update`,
+`auto_update`), a download URL (`update_proxy`), a credential (`secret`), or any key that is
+not explicitly named: the panel cannot become a channel that makes an agent act.
+
+The serialized output is **byte-identical** to the pre-refactor implementation for existing
+configs, so the MD5 a deployed agent verifies does not change and no agent re-applies its
+config.
+
 ### Where heavy work belongs: the DO has 30 s, a Worker request has no clean ceiling
 
 Measured on this account (Workers Free) on 2026-10-28 with a throwaway probe worker, burning
@@ -228,14 +263,19 @@ reach zero and then retire the shared secret. `get_agent_token_status` returns
 `shared_secret_usage_count` (this hour), `shared_secret_usage_total` and
 `shared_secret_usage_last_used_at`; every shared-secret report also logs the count.
 
-> **The counter only covers the HTTP ingest path.** The agent WebSocket path
-> (`src/durable/MetricsBroadcaster.js:706`) still compares against `API_SECRET`
-> directly and does not accept node tokens yet — that file was out of scope for this
-> change. Until it is updated, agents reporting over WSS keep using the shared secret
-> **without being counted**, so do **not** retire `API_SECRET` on the counter alone.
-> The needed change there is to call `authenticateAgentCredential(this.env.DB, data.secret,
-> this.env.API_SECRET)` instead of `timingSafeEqualString(...)`, and to reject a node
-> token whose `serverId` differs from the reported one.
+Both ingest paths go through the **same** credential check — `authenticateAgentCredential()`
+in `src/utils/agentTokens.js` — so HTTP and WSS reports both move the counter and both
+accept a node token. The Durable Object path is covered by `test/agent-token-ws.test.js`:
+a valid node token is accepted, a node token used for another server is rejected with 401,
+the shared secret is accepted **and counted**, and an unknown credential is rejected.
+Reverting the Durable Object to the old shared-secret-only comparison fails two of those
+four.
+
+> **This work is not deployed.** Production still runs the pre-token build, and there is no
+> `cfsm-agent` fork that can send a node token yet. The shared secret is still accepted, so
+> the deployed agents keep working either way — but **do not retire `API_SECRET` on the
+> counter alone**: every host has to be re-provisioned with its own token first, and the
+> token plaintext cannot be read back from the panel.
 
 > Migrating a host to its own token means re-provisioning it: `cf-probe install -id=<UUID>
 > -secret='<node token>' …`, then restart `cf-probe.service`. The node token plaintext is
