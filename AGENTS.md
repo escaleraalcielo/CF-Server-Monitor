@@ -48,26 +48,29 @@ npx wrangler secret put JWT_SECRET
 
 Local copies of the live credentials live at `~/.config/cf-server-monitor/credentials.env` (mode 600).
 
-### Password hashing is bounded by the plan, not by the guidance
+### Password hashing is bounded by the platform, not by the guidance
 
 `PASSWORD_HASH_ITERATIONS` is **50 000**, not the OWASP figure of 600 000. That is not an
-oversight — it is measured. This account runs on **Workers Free**, where one request gets
-**10 ms of CPU**, and the budget is enforced per derivation. Measured on the edge with a
-throwaway probe worker on the same account:
+oversight — **workerd hard-caps PBKDF2 at 100 000 iterations**
+(`cloudflare/workerd#1346`, a DoS guard). Above that, `crypto.subtle.deriveBits` throws
+`NotSupportedError`, the login endpoint 500s, and the panel becomes unreachable.
 
-| Workload | Result |
-|---|---|
-| 1 × 50 000 iterations | 200 |
-| 1 × 100 000 iterations | 200 |
-| 1 × 110 000 iterations | **1101** (over budget) |
-| 2 × 100 000 iterations | 200 |
-| 3 × 100 000 iterations | 200 |
+Measured on the edge with a throwaway probe worker on this account (and deleted afterwards):
 
-So the ceiling is roughly 100 000 iterations **per derivation**; the number of derivations
-does not add up against the budget. At 600 000 every login would fail with 1101 and the
-panel would be unreachable — the OWASP figure is simply not reachable on this plan.
-50 000 is what production already runs on, with about 2× margin to the measured failure
-point. Raise it when the plan is upgraded.
+| Iterations | Result | Cloudflare `cpuTime` | `outcome` |
+|---|---|---|---|
+| 50 000 | 200 | 7 ms | ok |
+| 100 000 | 200 | 13 ms | ok |
+| 300 000 | **1101** | 0 ms | **exception** |
+| 600 000 | **1101** | 0 ms | **exception** |
+
+Two things worth keeping straight:
+
+- The failure is an **exception**, not `exceededCpu`. It is a runtime API limit, so
+  **upgrading the plan does not unlock 600 000** — there is no plan that allows it.
+- 50 000 is half the platform ceiling and costs **7 ms of CPU per login**, inside the
+  10 ms single-request budget of the Workers Free plan. 100 000 would also work (13 ms)
+  but sits over the documented budget and is closer to the runtime's tolerance.
 
 > The iteration count is stored inside the hash (`pbkdf2_sha256$<iterations>$<salt>$<hash>`),
 > so changing the constant never invalidates an existing password: old hashes still verify

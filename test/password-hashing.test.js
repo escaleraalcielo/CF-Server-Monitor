@@ -10,19 +10,16 @@ import {
 test('the password hash uses the current iteration count', async () => {
   const hash = await hashPassword('a-strong-admin-password');
   assert.ok(hash.startsWith(`${PASSWORD_HASH_ALGORITHM}$${PASSWORD_HASH_ITERATIONS}$`));
-  // Pinned to what the edge actually allows, not to the OWASP figure: the
-  // account runs on Workers Free, where a single request gets 10 ms of CPU.
-  // Measured on the edge with a throwaway probe worker: 100000 iterations in
-  // one derivation returns 200, 110000 returns 1101. The count of
-  // derivations does not add up against the budget - 3 x 100000 is fine -
-  // so the ceiling is per derivation.
-  //
-  // At 600000 every login would fail with 1101 and the panel would be
-  // unreachable. 50000 is the value production already runs on, with about
-  // a 2x margin to the measured failure point.
+  // Pinned to the platform ceiling, not to the OWASP figure. workerd caps
+  // PBKDF2 at 100000 iterations (cloudflare/workerd#1346, a DoS guard);
+  // above it crypto.subtle throws NotSupportedError and the login endpoint
+  // 500s. Measured on the edge with a throwaway probe worker: 50000 -> 200
+  // (7 ms cpuTime), 100000 -> 200 (13 ms), 300000 -> 1101 with outcome
+  // "exception" (not exceededCpu - it is a runtime API limit, so no plan
+  // unlocks it).
   assert.ok(
     PASSWORD_HASH_ITERATIONS <= 100000,
-    'the iteration count must stay inside the measured edge CPU budget'
+    'the iteration count must stay inside the platform PBKDF2 ceiling'
   );
   assert.ok(
     PASSWORD_HASH_ITERATIONS >= 50000,

@@ -50,14 +50,16 @@ export const PASSWORD_HASH_ALGORITHM = 'pbkdf2_sha256';
 // 所以改这个值不会让已存的密码失效：旧哈希照常校验通过，并在下次成功
 // 登录时按下面的规则升级。
 //
-// 为什么不是 OWASP 建议的 600000：这个账号跑在 Workers Free，单请求 CPU
-// 预算 10 ms。实测（同一个账号、同一个边缘运行时，临时探针 Worker 测的）：
-//   1 次 100000 次迭代 -> 200
-//   1 次 110000 次迭代 -> 1101（超预算）
-//   多次各 100000 次迭代 -> 200（预算是按每次调用算的，不是累加）
-// 所以单次派生的上限在 10 万次左右，600000 在这个套餐上根本走不通，
-// 照抄会让登录直接 1101、面板进不去。50000 是线上已经在跑、留了
-// 一倍余量的值。升套餐以后再往上调。
+// 为什么不是 OWASP 建议的 600000：workerd 对 PBKDF2 的迭代次数有硬上限
+// 100000（cloudflare/workerd#1346，防 DoS），超了 crypto.subtle 直接抛
+// NotSupportedError，登录接口 500，面板进不去。
+// 实测（同一账号、同一边缘运行时，临时探针 Worker）：
+//   50000 次  -> 200，cpuTime 7 ms
+//   100000 次 -> 200，cpuTime 13 ms
+//   300000 次 -> 1101，outcome=exception（不是 exceededCpu）
+//   600000 次 -> 1101，outcome=exception
+// 注意是平台运行时上限，不是套餐额度，所以升套餐也救不了 600000。
+// 50000 是上限的一半，单次登录 7 ms CPU，离 10 ms 的单请求预算还有余量。
 export const PASSWORD_HASH_ITERATIONS = 50000;
 const PASSWORD_SALT_BYTES = 16;
 const PASSWORD_HASH_BYTES = 32;
