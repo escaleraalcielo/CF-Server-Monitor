@@ -588,6 +588,11 @@ function buildWebhookUrl(settings, context, method) {
   if (!renderedUrl) throw new Error('missing webhook url');
 
   const url = new URL(renderedUrl);
+  // 只允许 http/https：Webhook 的目标是管理员自己填的，但没必要让
+  // data:、file: 之类的 scheme 走到 fetch 这一步。
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('unsupported webhook url scheme');
+  }
   if (method === 'GET') {
     for (const [key, value] of buildWebhookQueryParams(settings, context)) {
       if (!key) continue;
@@ -884,6 +889,12 @@ export async function sendNotification(settings, msg, notificationContext = {}) 
     }
     try {
       const endpoint = onebotUrl.trim();
+      // 同样只允许 http/https。OneBot 一般指向自建服务（可能是
+      // 127.0.0.1），所以这里不做地址白名单——目标本来就是管理员自己定的。
+      const endpointUrl = new URL(endpoint);
+      if (endpointUrl.protocol !== 'http:' && endpointUrl.protocol !== 'https:') {
+        throw new Error('unsupported onebot url scheme');
+      }
       const body = {
         [isGroup ? 'group_id' : 'user_id']: targetId,
         message: [
