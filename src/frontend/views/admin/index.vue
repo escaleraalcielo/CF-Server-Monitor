@@ -1774,11 +1774,6 @@ const clearInstallSecret = () => {
   apiSecret.value = ''
 }
 
-const getInstallCommand = (serverId) => {
-  const HOST = selectedApiBase.value
-  return `curl -sL ${HOST}/install.sh | bash -s install -id=${serverId} -secret='${apiSecret.value}' -url=${HOST}/update`
-}
-
 const resolveServerPingNode = (server, field) => {
   const value = server?.[field]
   const explicitEmpty = value === 0 || value === '0'
@@ -1813,7 +1808,7 @@ const getUninstallCommand = () => {
   return `curl -fsSL '${HOST}/uninstall.sh' | sh -s`
 }
 
-const copyCmd = (serverId) => {
+const copyCmd = async (serverId) => {
   const server = servers.value.find(s => s.id === serverId)
   copyServerId.value = serverId
   currentServerName.value = server?.name || ''
@@ -1854,9 +1849,10 @@ const copyCmd = (serverId) => {
   txCorrection.value = server?.tx_correction ?? ''
   autoUpdate.value = server?.auto_update === '1' || server?.auto_update === 1 || server?.auto_update === true
   copiedCmd.value = false
+  // 先拿到上报密钥再打开面板：否则首帧渲染出来的安装命令里
+  // -secret 会是空串，管理员复制到机器上就是一条坏命令。
+  await fetchInstallSecret()
   showCopyModal.value = true
-  // 安装命令里带上报密钥，打开面板时按需取一次。
-  fetchInstallSecret()
 }
 
 const buildGhRawUrl = (proxy, path) => {
@@ -1928,6 +1924,9 @@ const buildInstallAsCfsmCommand = (command, runStep) => {
 }
 
 const getCustomInstallCommand = () => {
+  // 没有上报密钥就不生成命令：生成 -secret='' 的命令比没有命令更糟，
+  // 管理员会把它原样粘到机器上。
+  if (!apiSecret.value) return ''
   const HOST = selectedApiBase.value
   const autoUpdateFlag = autoUpdate.value ? 1 : 0
   const proxy = installGhProxy.value.trim()
@@ -1980,6 +1979,8 @@ const getCustomInstallCommand = () => {
 // 自动发现模式下安装命令不带 -id：Agent 首次上报时由服务端自动创建服务器。
 // name 留空时服务端回退到请求来源 IP；安装用户、代理、版本、名称与自动更新仅影响本次生成的命令。
 const buildAutoDiscoveryCommand = ({ targetOs: os = 'linux', installMode: mode = 'current-user', ghProxy = '', name = '', version = '', autoUpdate = false } = {}) => {
+  // 同上：没有密钥就不生成命令。
+  if (!apiSecret.value) return ''
   const HOST = selectedApiBase.value
   const proxy = String(ghProxy || '').trim()
   const agentVersion = String(version || '').trim()
@@ -2028,16 +2029,16 @@ const getAutoDiscoveryInstallCommand = () => buildAutoDiscoveryCommand({
   autoUpdate: autoDiscoveryAutoUpdate.value
 })
 
-const openAutoDiscoveryModal = () => {
+const openAutoDiscoveryModal = async () => {
   if (!savedAutoDiscovery.value) {
     alertMessage.value = trans.value.autoAddDisabledTip
     return
   }
 
   autoDiscoveryCopied.value = false
+  // 同样先取密钥再开面板，避免复制到 -secret='' 的坏命令。
+  await fetchInstallSecret()
   showAutoDiscoveryModal.value = true
-  // 安装命令里带上报密钥，打开面板时按需取一次。
-  fetchInstallSecret()
 }
 
 const closeAutoDiscoveryModal = () => {
@@ -2046,7 +2047,18 @@ const closeAutoDiscoveryModal = () => {
 }
 
 const copyAutoDiscoveryCmd = async () => {
-  const copied = await copyTextToClipboard(getAutoDiscoveryInstallCommand())
+  // 同上：没有密钥就不复制。
+  if (!apiSecret.value) await fetchInstallSecret()
+  if (!apiSecret.value) {
+    alertMessage.value = trans.value.installSecretUnavailable
+    return
+  }
+  const cmd = getAutoDiscoveryInstallCommand()
+  if (!cmd) {
+    alertMessage.value = trans.value.installSecretUnavailable
+    return
+  }
+  const copied = await copyTextToClipboard(cmd)
   if (!copied) {
     alertMessage.value = trans.value.httpsRequired
     return
@@ -2059,7 +2071,18 @@ const copyAutoDiscoveryCmd = async () => {
 }
 
 const copyCustomCmd = async () => {
+  // 复制前再确认一次密钥在手上：拿不到就别复制，
+  // 免得把 -secret='' 的命令粘到机器上。
+  if (!apiSecret.value) await fetchInstallSecret()
+  if (!apiSecret.value) {
+    alertMessage.value = trans.value.installSecretUnavailable
+    return
+  }
   const cmd = getCustomInstallCommand()
+  if (!cmd) {
+    alertMessage.value = trans.value.installSecretUnavailable
+    return
+  }
   const copied = await copyTextToClipboard(cmd)
   if (!copied) {
     alertMessage.value = trans.value.httpsRequired
@@ -2081,6 +2104,7 @@ const openEditModalFromCopy = () => {
   const server = servers.value.find(s => s.id === copyServerId.value)
   if (server) {
     showCopyModal.value = false
+    clearInstallSecret()
     openEditModal(server)
   }
 }
