@@ -73,6 +73,23 @@ export async function ensureAgentTokenSchema(db) {
   await db.prepare(AGENT_TOKEN_INDEX_SQL).run();
 }
 
+/**
+ * 确保 servers 表拥有持久化流量基线列（traffic_baseline）。
+ */
+export async function ensureTrafficBaselineSchema(db) {
+  try {
+    const { results: columns = [] } = await db.prepare('PRAGMA table_info(servers)').all();
+    if (Array.isArray(columns) && columns.some(col => col?.name === 'traffic_baseline')) {
+      return;
+    }
+    await db.prepare('ALTER TABLE servers ADD COLUMN traffic_baseline TEXT DEFAULT NULL').run();
+  } catch (e) {
+    if (!/duplicate column name/i.test(String(e?.message || e || ''))) {
+      debug('检查 traffic_baseline 字段失败:', e);
+    }
+  }
+}
+
 export async function initDatabase(db) {
   if (dbInitialized) return;
 
@@ -114,6 +131,7 @@ export async function initDatabase(db) {
           traffic_calc_type TEXT DEFAULT 'total',
           traffic_alert_percent INTEGER DEFAULT NULL,
           traffic_alert_state TEXT,
+          traffic_baseline TEXT DEFAULT NULL,
           "interface" TEXT DEFAULT '',
           reset_day INTEGER DEFAULT 1,
           collect_interval INTEGER DEFAULT 0,
@@ -149,6 +167,8 @@ export async function initDatabase(db) {
 
     // 节点令牌表：新装和存量部署都要有同一份结构，CREATE TABLE IF NOT EXISTS 幂等
     await ensureAgentTokenSchema(db);
+    // 流量基线列：存量部署补齐 servers.traffic_baseline
+    await ensureTrafficBaselineSchema(db);
 
     debug('✅ 数据库初始化完成');
     dbInitialized = true;

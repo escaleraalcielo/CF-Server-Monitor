@@ -24,6 +24,11 @@ import {
   normalizePctOrNull,
   normalizeTrafficLimitGb
 } from '../utils/traffic.js';
+import {
+  hasRawTrafficCounters,
+  isTrafficBaselineApplied,
+  reconcileServerTrafficBaseline
+} from '../utils/trafficBaseline.js';
 import { detectBillingCycle, isEnabledFlag, normalizeBillingCycle, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
 import {
   NOTIFICATION_MAX_RETRIES,
@@ -686,6 +691,16 @@ function parseTrafficAlertState(raw) {
 export async function evaluateTrafficAlert(env, server, metrics, hooks = {}) {
   try {
     if (!env?.DB || !server || !metrics) return;
+
+    if (!isTrafficBaselineApplied(metrics) && hasRawTrafficCounters(metrics)) {
+      const sample = {
+        ts: metrics.timestamp ?? Date.now(),
+        metrics
+      };
+      await reconcileServerTrafficBaseline(env.DB, server, [sample], metrics, {
+        patchCache: hooks.patchBaselineCache
+      });
+    }
 
     const limit = normalizeTrafficLimitGb(server.traffic_limit);
     if (limit <= 0) return; // 未设限额：不监控
