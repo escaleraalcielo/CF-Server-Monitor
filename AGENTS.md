@@ -48,6 +48,32 @@ npx wrangler secret put JWT_SECRET
 
 Local copies of the live credentials live at `~/.config/cf-server-monitor/credentials.env` (mode 600).
 
+### What the browser may see (2026-10-28)
+
+`get_settings` no longer returns `api_secret`. That value is the shared key every agent
+authenticates with and it sits in `config.conf` on every monitored host, so anything that
+can read the admin panel could read it too. It now comes from a separate
+`get_install_secret` action that the admin UI calls **only when the install-command
+dialog opens**, and drops when it closes.
+
+`turnstile_secret_key` and `cloudflare_token` are returned **masked**
+(`••••••••`) with a `*_configured` flag. Saving a masked value means "unchanged":
+`stripMaskedSecrets` drops it from the update so the spread in `saveSiteOptions` keeps the
+stored value. A newly typed value still replaces it. The mask is deliberately non-empty so
+the form does not read as "unset".
+
+> `tg_bot_token` is **not** masked. It doubles as the SMTP channel carrier
+> (`smtp://user:pass@host:port`), so masking it breaks channel detection and the
+> "switch back to builtin" path that clears the field. Redacting it properly needs a
+> separate field for the SMTP config, not a mask — left as a known gap.
+
+> The admin API is behind Cloudflare Access, so it cannot be driven from a plain
+> `curl`. To exercise it end-to-end, run the worker locally against a D1 seeded with a
+> copy of the production `site_options` row:
+> `npx wrangler d1 execute server-monitor-db --local --persist-to <dir> --file seed.sql`
+> then `npx wrangler dev --local --persist-to <dir> --port 8802 --var API_SECRET:...`.
+> `https://localhost:8802` uses a local TLS cert, so use `curl -k`.
+
 > **`API_SECRET` was rotated 2026-10-28.** The previous value had been written into an
 > agent session log and was therefore uploaded to MEGA inside the AgentsView archive
 > (`~/.agentsview/sessions.db`, backed up nightly). Rotating invalidated it — every
