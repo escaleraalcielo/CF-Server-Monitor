@@ -759,26 +759,26 @@
 
         <div class="ping-node-grid">
           <div class="ping-node-item">
-            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_ct_name" class="form-input ping-node-name"><span class="ping-node-arrow">→</span>
+            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_ct_name" class="form-input ping-node-name" :placeholder="trans.pingCt"><span class="ping-node-arrow">→</span>
             <input type="text" v-model.trim="settings.custom_ct" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_ct }]" placeholder="gd-ct-dualstack.ip.zstaticcdn.com">
             </div><p v-if="pingNodeErrors.custom_ct" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_ct }}</p>
           </div>
 
           <div class="ping-node-item">
-            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_cu_name" class="form-input ping-node-name"><span class="ping-node-arrow">→</span>
+            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_cu_name" class="form-input ping-node-name" :placeholder="trans.pingCu"><span class="ping-node-arrow">→</span>
             <input type="text" v-model.trim="settings.custom_cu" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_cu }]" placeholder="gd-cu-dualstack.ip.zstaticcdn.com">
             </div><p v-if="pingNodeErrors.custom_cu" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_cu }}</p>
           </div>
         </div>
         <div class="ping-node-grid">
           <div class="ping-node-item">
-            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_cm_name" class="form-input ping-node-name"><span class="ping-node-arrow">→</span>
+            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_cm_name" class="form-input ping-node-name" :placeholder="trans.pingCm"><span class="ping-node-arrow">→</span>
             <input type="text" v-model.trim="settings.custom_cm" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_cm }]" placeholder="gd-cm-dualstack.ip.zstaticcdn.com">
             </div><p v-if="pingNodeErrors.custom_cm" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_cm }}</p>
           </div>
 
           <div class="ping-node-item">
-            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_bd_name" class="form-input ping-node-name"><span class="ping-node-arrow">→</span>
+            <div class="ping-node-fields"><input type="text" v-model.trim="settings.custom_bd_name" class="form-input ping-node-name" :placeholder="trans.pingBd"><span class="ping-node-arrow">→</span>
             <input type="text" v-model.trim="settings.custom_bd" :class="['form-input', { 'input-invalid': pingNodeErrors.custom_bd }]" placeholder="ip.zstaticcdn.com">
             </div><p v-if="pingNodeErrors.custom_bd" class="text-red text-sm mt-1">{{ pingNodeErrors.custom_bd }}</p>
           </div>
@@ -1066,6 +1066,16 @@ const SMTP_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 const isSmtpToken = token => String(token || '').trim().toLowerCase().indexOf('smtp:') === 0
 
+// 服务端把 tg_bot_token 回传成掩码，smtp:// 前缀保留。
+// 掩码不能拿去解析：解析出来的主机/账号/密码是 '••••'，
+// 再被 syncSmtpToken 序列化回去就会把库里真实的 SMTP 配置覆盖掉。
+const isMaskedToken = token => {
+  const mask = String(props.settings.secret_mask || '').trim()
+  const raw = String(token || '').trim()
+  if (!mask || !raw) return false
+  return raw === mask || raw.endsWith(mask)
+}
+
 const safeDecode = value => {
   try {
     return decodeURIComponent(value)
@@ -1198,9 +1208,17 @@ const notificationChannel = computed({
     }
     props.settings.notification_webhook_enabled = false
     if (value === 'smtp') {
-      if (isSmtpToken(props.settings.tg_bot_token)) {
+      if (isSmtpToken(props.settings.tg_bot_token) && !isMaskedToken(props.settings.tg_bot_token)) {
         applySmtpToken(props.settings.tg_bot_token)
         smtpTokenApplied.value = true
+      } else if (isMaskedToken(props.settings.tg_bot_token)) {
+        // 库里已配置 SMTP，但服务端只给了掩码：表单留空，
+        // 不去解析掩码（否则会把 '••••' 解析成主机/账号再写回去）。
+        // smtpTokenApplied 必须保持 false：它是 true 时 syncSmtpToken 会跳过
+        // 完整性检查，把空表单序列化成 '' 写回共享字段，
+        // 下一次保存就会把库里的真实 SMTP 配置清掉。
+        Object.assign(smtpConfig, defaultSmtpConfig())
+        smtpTokenApplied.value = false
       } else {
         Object.assign(smtpConfig, defaultSmtpConfig())
         smtpTokenApplied.value = false
@@ -1230,7 +1248,12 @@ watch(smtpConfig, () => {
 watch(() => props.settings.tg_bot_token, (token) => {
   if (isSmtpToken(token)) {
     smtpChannelActive.value = true
-    smtpTokenApplied.value = true
+    // 掩码只说明"库里配了 SMTP"，不是可解析的值：
+    // 解析它会把 '••••' 当成主机/账号/密码，再被 syncSmtpToken 写回去，
+    // 覆盖掉库里的真实配置。smtpTokenApplied 同样保持 false，
+    // 这样管理员没填完表单前 syncSmtpToken 不会写回共享字段。
+    smtpTokenApplied.value = !isMaskedToken(token)
+    if (isMaskedToken(token)) return
     if (buildSmtpToken(smtpConfig) !== String(token).trim()) {
       applySmtpToken(token)
     }

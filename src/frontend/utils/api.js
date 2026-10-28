@@ -413,6 +413,13 @@ export const login = async (username, password, turnstileToken = '', apiIndex = 
   
   if (!result.error && result.data && result.data.token) {
     localStorage.setItem(STORAGE.JWT_TOKEN, result.data.token)
+    // A bootstrap session is scoped to setting a password; remember it so the
+    // panel can force that form instead of rendering the normal admin view.
+    if (result.data.bootstrap) {
+      localStorage.setItem(STORAGE.BOOTSTRAP_SESSION, '1')
+    } else {
+      localStorage.removeItem(STORAGE.BOOTSTRAP_SESSION)
+    }
   }
   return result
 }

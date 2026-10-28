@@ -402,6 +402,8 @@ export default {
   confirmPassword: 'パスワード確認',
   apiSecretTip: 'サーバーレポート用の API_SECRET は、ここのパスワード設定に関係なく環境変数を使用します。',
   passwordRequired: '管理者パスワードが設定されていません。保存する前に設定してください。',
+  apiSecretNotConfigured: 'サーバー取り込みシークレットが未設定です。インストールコマンドを生成する前に API_SECRET を設定してください。',
+  installSecretUnavailable: '取り込みシークレットを取得できませんでした。インストールコマンドには必要です。もう一度お試しください。',
   passwordMismatch: 'パスワードが一致しません',
   usernameRequired: 'ユーザー名は必須です',
   securitySettings: 'セキュリティ設定',

@@ -37,5 +37,6 @@ export const STORAGE = {
   VIEW_PREFERENCE: 'monitor_preferred_view',
   JWT_TOKEN: 'jwt_token',
   TURNSTILE_TOKEN: 'turnstile_token',
-  TURNSTILE_VERIFIED: 'turnstile_verified'
+  TURNSTILE_VERIFIED: 'turnstile_verified',
+  BOOTSTRAP_SESSION: 'bootstrap_session'
 }

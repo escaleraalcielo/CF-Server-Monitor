@@ -402,6 +402,8 @@ export default {
   confirmPassword: '确认密码',
   apiSecretTip: '服务器上报使用的 API_SECRET 仍使用环境变量，不受此处密码设置影响。',
   passwordRequired: '尚未配置管理员密码，请先设置密码再保存。',
+  apiSecretNotConfigured: '服务器上报密钥未配置。生成安装命令前请先设置 API_SECRET。',
+  installSecretUnavailable: '无法获取上报密钥。安装命令需要它，请重试。',
   passwordMismatch: '两次输入的密码不一致',
   usernameRequired: '用户名不能为空',
   securitySettings: '安全设置',

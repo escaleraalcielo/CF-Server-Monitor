@@ -402,6 +402,8 @@ export default {
   confirmPassword: 'Confirmar contraseña',
   apiSecretTip: 'El API_SECRET para los reportes de servidores sigue usando la variable de entorno, sin importar la contraseña configurada aquí.',
   passwordRequired: 'No hay contraseña de admin configurada. Define una antes de guardar.',
+  apiSecretNotConfigured: 'La clave de上报 del servidor no está configurada. Define API_SECRET antes de generar los comandos de instalación.',
+  installSecretUnavailable: 'No se pudo cargar la clave de上报. El comando de instalación la necesita; inténtalo de nuevo.',
   passwordMismatch: 'Las contraseñas no coinciden',
   usernameRequired: 'El usuario es obligatorio',
   securitySettings: 'Configuración de seguridad',

@@ -15,6 +15,36 @@ export const APPEARANCE_FIELDS = ['site_title', 'custom_bg', 'custom_bg_mobile',
 
 export const SITE_FIELDS = ['auto_discovery', 'is_public', 'show_price', 'show_expire', 'show_tf', 'show_three_net_details', 'wss_report_enabled', 'wss_report_hours', 'frontend_ws_timeout_minutes', 'long_history_points', 'tg_notify', 'tg_bot_token', 'tg_chat_id', 'notification_timezone', 'notification_language', 'expire_notification_time', 'notification_webhook_enabled', 'notification_webhook_url', 'notification_webhook_method', 'notification_webhook_format', 'notification_webhook_headers', 'notification_webhook_body', 'notification_template', 'turnstile_enabled', 'turnstile_login_enabled', 'turnstile_site_key', 'turnstile_secret_key', 'jwt_secret', 'username', 'password', 'cloudflare_account_id', 'cloudflare_token', 'custom_ct', 'custom_cu', 'custom_cm', 'custom_bd', 'node_1', 'node_2', 'node_3', 'node_4', 'custom_ct_name', 'custom_cu_name', 'custom_cm_name', 'custom_bd_name', 'node_1_name', 'node_2_name', 'node_3_name', 'node_4_name', 'expire_reminder', 'resource_alert_rules', 'traffic_alert_threshold', 'theme_url', 'servers_optimized'];
 
+// 凭据字段：读取接口只回传掩码，绝不把真实值发到浏览器。
+// 保存时掩码表示"管理员没有改动这一项"——保留库中原值；空字符串表示主动清空。
+// tg_bot_token 同时承载 SMTP 渠道配置（smtp://user:pass@host:port），
+// 掩码保留 smtp: 前缀，这样前端的渠道识别不用改。
+export const SECRET_SETTING_FIELDS = ['turnstile_secret_key', 'cloudflare_token', 'tg_bot_token'];
+export const SECRET_MASK = '••••••••';
+const SMTP_MASK_PREFIX = 'smtp://';
+
+export function maskSecretValue(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  return raw.toLowerCase().startsWith('smtp:') ? SMTP_MASK_PREFIX + SECRET_MASK : SECRET_MASK;
+}
+
+export function isMaskedSecretValue(value) {
+  const raw = String(value ?? '');
+  return raw === SECRET_MASK || raw === SMTP_MASK_PREFIX + SECRET_MASK;
+}
+
+// 前端回传掩码 = 管理员没有改动这一项。把掩码从更新里摘掉，
+// 这样 {...existing, ...updates} 的展开就会保留库里的真实值，
+// 而不是用掩码把它覆盖掉。
+export function stripMaskedSecrets(updates = {}) {
+  const safe = { ...(updates || {}) };
+  for (const field of SECRET_SETTING_FIELDS) {
+    if (isMaskedSecretValue(safe[field])) delete safe[field];
+  }
+  return safe;
+}
+
 export const TG_NOTIFY_MINUTES_MIN = 2;
 export const TG_NOTIFY_MINUTES_MAX = 30;
 export const TG_NOTIFY_LEGACY_TRUE_MINUTES = 5;
@@ -116,10 +146,13 @@ const defaults = {
   node_2: '',
   node_3: '',
   node_4: '',
-  custom_ct_name: '电信',
-  custom_cu_name: '联通',
-  custom_cm_name: '移动',
-  custom_bd_name: 'BGP',
+  // Ping node labels default to empty so the frontend can fall back to the
+  // active UI locale. A hardcoded Chinese default would leak into every
+  // non-Chinese deployment.
+  custom_ct_name: '',
+  custom_cu_name: '',
+  custom_cm_name: '',
+  custom_bd_name: '',
   node_1_name: 'Node 1',
   node_2_name: 'Node 2',
   node_3_name: 'Node 3',
@@ -791,7 +824,7 @@ export async function saveSiteOptions(db, updates) {
     ? await loadLegacySettings(db, SITE_FIELDS)
     : {};
   
-  const merged = { ...legacySiteOptions, ...existingSiteOptions, ...updates };
+  const merged = { ...legacySiteOptions, ...existingSiteOptions, ...stripMaskedSecrets(updates) };
   const siteOptions = {};
   for (const field of SITE_FIELDS) {
     if (field in merged) siteOptions[field] = merged[field];

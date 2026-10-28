@@ -46,6 +46,20 @@ export async function verifyTurnstileToken(token, secretKey) {
  * 管理后台密码哈希参数
  */
 export const PASSWORD_HASH_ALGORITHM = 'pbkdf2_sha256';
+// 迭代次数写在哈希串里（pbkdf2_sha256$<iterations>$<salt>$<hash>），
+// 所以改这个值不会让已存的密码失效：旧哈希照常校验通过，并在下次成功
+// 登录时按下面的规则升级。
+//
+// 为什么不是 OWASP 建议的 600000：workerd 对 PBKDF2 的迭代次数有硬上限
+// 100000（cloudflare/workerd#1346，防 DoS），超了 crypto.subtle 直接抛
+// NotSupportedError，登录接口 500，面板进不去。
+// 实测（同一账号、同一边缘运行时，临时探针 Worker）：
+//   50000 次  -> 200，cpuTime 7 ms
+//   100000 次 -> 200，cpuTime 13 ms
+//   300000 次 -> 1101，outcome=exception（不是 exceededCpu）
+//   600000 次 -> 1101，outcome=exception
+// 注意是平台运行时上限，不是套餐额度，所以升套餐也救不了 600000。
+// 50000 是上限的一半，单次登录 7 ms CPU，离 10 ms 的单请求预算还有余量。
 export const PASSWORD_HASH_ITERATIONS = 50000;
 const PASSWORD_SALT_BYTES = 16;
 const PASSWORD_HASH_BYTES = 32;
@@ -83,6 +97,29 @@ function timingSafeEqualBytes(left, right) {
     diff |= (left[i] || 0) ^ (right[i] || 0);
   }
   return diff === 0;
+}
+
+/**
+ * 常量时间字符串比较：用于共享密钥（API_SECRET）等机密值的比对，
+ * 避免通过响应时间差异逐字节猜测密钥。
+ * 注意：长度不同的字符串会走不同的摘要长度分支，这里先统一做摘要再比较，
+ * 保证比较耗时与内容无关。
+ * @param {string} left
+ * @param {string} right
+ * @returns {Promise<boolean>}
+ */
+export async function timingSafeEqualString(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') {
+    return false;
+  }
+
+  const encoder = new TextEncoder();
+  const [leftDigest, rightDigest] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(left)),
+    crypto.subtle.digest('SHA-256', encoder.encode(right))
+  ]);
+
+  return timingSafeEqualBytes(new Uint8Array(leftDigest), new Uint8Array(rightDigest));
 }
 
 async function derivePbkdf2Hash(password, salt, iterations) {
@@ -151,9 +188,13 @@ export async function verifyPasswordHash(password, storedHash) {
   const parsed = parsePbkdf2Hash(storedHash);
   if (parsed) {
     const hash = await derivePbkdf2Hash(password, parsed.salt, parsed.iterations);
+    const valid = timingSafeEqualBytes(hash, parsed.hash);
     return {
-      valid: timingSafeEqualBytes(hash, parsed.hash),
-      needsRehash: false,
+      valid,
+      // 强度不够的哈希（迭代次数低于当前标准）标记为需要升级：
+      // 登录成功后用新参数重新哈希一次。语义与 MD5 分支一致——
+      // 只有校验通过时才值得重写，校验失败时不该动库里的哈希。
+      needsRehash: valid && parsed.iterations < PASSWORD_HASH_ITERATIONS,
       algorithm: PASSWORD_HASH_ALGORITHM
     };
   }

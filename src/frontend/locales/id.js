@@ -402,6 +402,8 @@ export default {
   confirmPassword: 'Konfirmasi Kata Sandi',
   apiSecretTip: 'API_SECRET untuk pelaporan server tetap memakai variabel lingkungan, terlepas dari pengaturan kata sandi di sini.',
   passwordRequired: 'Belum ada kata sandi admin. Tetapkan kata sandi sebelum menyimpan.',
+  apiSecretNotConfigured: 'Rahasia ingestion server belum dikonfigurasi. Atur API_SECRET sebelum membuat perintah instalasi.',
+  installSecretUnavailable: 'Tidak dapat memuat rahasia ingestion. Perintah instalasi membutuhkannya — coba lagi.',
   passwordMismatch: 'Kata sandi tidak cocok',
   usernameRequired: 'Nama pengguna wajib diisi',
   securitySettings: 'Pengaturan Keamanan',

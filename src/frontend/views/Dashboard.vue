@@ -389,6 +389,7 @@ import {
   convertCnyAmount,
   formatFinanceAmount,
   getDailyExchangeRates,
+  getDefaultFinanceCurrency,
   getStoredFinanceCurrency,
   normalizeFinanceCurrency,
   setStoredFinanceCurrency
@@ -403,10 +404,12 @@ const sysConfig = ref({
   show_expire: true,
   show_tf: true,
   show_three_net_details: true,
-  custom_ct_name: appConfig?.custom_ct_name || '电信',
-  custom_cu_name: appConfig?.custom_cu_name || '联通',
-  custom_cm_name: appConfig?.custom_cm_name || '移动',
-  custom_bd_name: appConfig?.custom_bd_name || 'BGP',
+  // Ping node labels come from the admin settings; when unset they fall back
+  // to the localised defaults, so a non-Chinese locale never shows Chinese.
+  custom_ct_name: appConfig?.custom_ct_name || '',
+  custom_cu_name: appConfig?.custom_cu_name || '',
+  custom_cm_name: appConfig?.custom_cm_name || '',
+  custom_bd_name: appConfig?.custom_bd_name || '',
   node_1_name: appConfig?.node_1_name || 'Node 1',
   node_2_name: appConfig?.node_2_name || 'Node 2',
   node_3_name: appConfig?.node_3_name || 'Node 3',
@@ -435,7 +438,7 @@ const sitesRemaining = ref(0)
 const hasCorsError = ref(null)
 const financeModalOpen = ref(false)
 const showLiveTimeoutModal = ref(false)
-const financeCurrency = ref('CNY')
+const financeCurrency = ref(getDefaultFinanceCurrency(currentLang.value))
 const exchangeRates = ref(DEFAULT_EXCHANGE_RATES)
 const exchangeRateSource = ref('default')
 const now = ref(Date.now())
@@ -1309,7 +1312,7 @@ const goToServer = (server) => {
 }
 
 onMounted(async () => {
-  financeCurrency.value = getStoredFinanceCurrency()
+  financeCurrency.value = getStoredFinanceCurrency(currentLang.value)
   loadFinanceRates()
 
   await loadDashboardConfig()

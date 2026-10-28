@@ -1,10 +1,12 @@
-import { buildAuthCookie, buildClearAuthCookie, checkAuth, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
+import { buildAuthCookie, buildClearAuthCookie, checkAuth, getAuthPayload, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
 import { getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, clearServersListCache } from '../utils/cache.js';
-import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
+import { clearAppearanceSettingsCache, isMaskedSecretValue, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, maskSecretValue, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SECRET_MASK, SECRET_SETTING_FIELDS, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
+import { readJsonBodyWithLimit } from '../utils/requestBody.js';
 import { normalizePctOrNull } from '../utils/traffic.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
+import { clearLoginFailures, getLoginBackoffMs, registerLoginFailure } from '../utils/loginRateLimit.js';
 import { AppError, createSuccessResponse, createBadRequestResponse, createUnauthorizedResponse, createErrorResponse } from '../utils/errors.js';
 import { addServerColumns } from '../database/updateDatabase.js';
 import { clearResourceAlertState, isSmtpNotificationTarget, sendNotification } from '../services/notification.js';
@@ -469,6 +471,12 @@ async function handleLoginAction({ request, env, sys, data }) {
     return createBadRequestResponse('missingCredentials');
   }
 
+  // 暴力破解抑制：处于退避窗口内直接拒绝，不再消耗 PBKDF2 校验开销。
+  const backoffMs = getLoginBackoffMs(request);
+  if (backoffMs > 0) {
+    return createErrorResponse(new AppError('tooManyAttempts', 429));
+  }
+
   const turnstileEnabled = sys && (sys.turnstile_enabled === 'true' || sys.turnstile_enabled === true);
   const turnstileLoginEnabled = sys && (sys.turnstile_login_enabled === 'true' || sys.turnstile_login_enabled === true);
   const turnstileSecretKey = sys && sys.turnstile_secret_key || '';
@@ -485,8 +493,11 @@ async function handleLoginAction({ request, env, sys, data }) {
   const credentialResult = await validateCredentials(username, password, env, sys);
 
   if (!credentialResult.valid) {
+    registerLoginFailure(request);
     return createUnauthorizedResponse('invalidCredentials');
   }
+
+  clearLoginFailures(request);
 
   if (credentialResult.needsPasswordUpgrade) {
     try {
@@ -501,10 +512,15 @@ async function handleLoginAction({ request, env, sys, data }) {
   }
 
   try {
-    const token = await generateToken(env, sys);
+    // A bootstrap login (default credentials on a fresh install) is scoped so
+    // it can only be used to set an independent password. It never grants
+    // panel access.
+    const scope = credentialResult.bootstrap ? 'bootstrap' : null;
+    const token = await generateToken(env, sys, scope ? { scope } : {});
     return createSuccessResponse({
       success: true,
       token: token,
+      bootstrap: !!credentialResult.bootstrap,
       message: 'loginSuccessful'
     }, {
       'Set-Cookie': buildAuthCookie(request, token)
@@ -539,17 +555,41 @@ const PUBLIC_ADMIN_ACTION_HANDLERS = {
 
 export function sanitizeAdminSettings(fullSettings = {}) {
   const { jwt_secret, password, ...safeSettings } = fullSettings || {};
-  return {
+  const sanitized = {
     ...safeSettings,
     password_configured: Boolean(String(password || '').trim())
   };
+  // 凭据字段只回传掩码，并单独给出"是否已配置"标志，
+  // 前端据此显示为已配置状态而不是空。掩码本身也一并下发，
+  // 前端靠它识别"这个值是掩码，不是真值"。
+  for (const field of SECRET_SETTING_FIELDS) {
+    sanitized[field] = maskSecretValue(sanitized[field]);
+    sanitized[`${field}_configured`] = Boolean(String(fullSettings?.[field] || '').trim());
+  }
+  sanitized.secret_mask = SECRET_MASK;
+  return sanitized;
 }
 
 async function handleGetSettingsAction({ env, sys, loadFullSettings }) {
   const fullSettings = loadFullSettings ? await loadFullSettings() : sys;
+  // 注意：这里不再返回 api_secret。它是所有 Agent 共用的上报密钥，
+  // 也写在每台被监控机器的 config.conf 里；把它放进常规设置响应
+  // 意味着任何能打开后台的浏览器（包括面板自身域上的 XSS）都能读到它。
+  // 需要安装命令时由 get_install_secret 按需单独下发。
   return createSuccessResponse({
     success: true,
-    settings: sanitizeAdminSettings(fullSettings),
+    settings: sanitizeAdminSettings(fullSettings)
+  });
+}
+
+// 仅在管理员显式打开"安装命令"面板时按需下发上报密钥，
+// 面板关闭后前端即丢弃，不进入常规设置状态。
+async function handleGetInstallSecretAction({ env }) {
+  if (!env.API_SECRET) {
+    return createBadRequestResponse('apiSecretNotConfigured');
+  }
+  return createSuccessResponse({
+    success: true,
     api_secret: env.API_SECRET
   });
 }
@@ -666,7 +706,11 @@ async function handleListAction({ env, data }) {
 async function handleD1UsageAction({ data, sys }) {
   const hasCloudflareToken = Object.prototype.hasOwnProperty.call(data, 'cloudflare_token');
   const hasCloudflareAccountId = Object.prototype.hasOwnProperty.call(data, 'cloudflare_account_id');
-  const cloudflareToken = hasCloudflareToken ? data.cloudflare_token : (sys?.cloudflare_token || '');
+  // 优先用库里存的那个 Cloudflare 令牌：前端拿到的是掩码，
+  // 用它去查 GraphQL 会直接失败。客户端传来的值只作为兜底。
+  const storedToken = String(sys?.cloudflare_token || '').trim();
+  const clientToken = String(data.cloudflare_token || '').trim();
+  const cloudflareToken = storedToken || (hasCloudflareToken ? clientToken : '');
   const cloudflareAccountId = hasCloudflareAccountId ? data.cloudflare_account_id : (sys?.cloudflare_account_id || '');
 
   try {
@@ -681,7 +725,7 @@ async function handleD1UsageAction({ data, sys }) {
   }
 }
 
-async function handleSendTestNotificationAction({ data }) {
+async function handleSendTestNotificationAction({ data, sys }) {
   const {
     tg_bot_token,
     tg_chat_id,
@@ -696,21 +740,26 @@ async function handleSendTestNotificationAction({ data }) {
     notification_language,
     expire_notification_time
   } = data;
-  const webhookEnabled = normalizeBooleanSetting(notification_webhook_enabled) === 'true';
-  if (webhookEnabled) {
-    if (!notification_webhook_url || String(notification_webhook_url).trim().length === 0) {
-      return createBadRequestResponse('notificationWebhookUrlRequired');
+    // 前端拿到的是掩码，不是真值。管理员没有改这一项时用库里的副本；
+    // 改过的话客户端传来的是新值（不是掩码），用那个。
+    const clientToken = String(tg_bot_token || '').trim();
+    const storedToken = String(sys?.tg_bot_token || '').trim();
+    const effectiveToken = isMaskedSecretValue(clientToken) ? storedToken : (clientToken || storedToken);
+    const webhookEnabled = normalizeBooleanSetting(notification_webhook_enabled) === 'true';
+    if (webhookEnabled) {
+      if (!notification_webhook_url || String(notification_webhook_url).trim().length === 0) {
+        return createBadRequestResponse('notificationWebhookUrlRequired');
+      }
+    } else if (isSmtpNotificationTarget(effectiveToken)) {
+      // SMTP 邮件渠道（smtp:// 前缀）视为有效的内置通知目标
+    } else if (!effectiveToken) {
+      return createBadRequestResponse('tgBotTokenRequired');
     }
-  } else if (isSmtpNotificationTarget(tg_bot_token)) {
-    // SMTP 邮件渠道（smtp:// 前缀）视为有效的内置通知目标
-  } else if (!tg_bot_token || tg_bot_token.trim().length === 0) {
-    return createBadRequestResponse('tgBotTokenRequired');
-  }
-  try {
-    const notificationLanguage = normalizeNotificationLanguage(notification_language);
-    const messages = getNotificationMessages({ notification_language: notificationLanguage });
-    const result = await sendNotification({
-      tg_bot_token,
+    try {
+      const notificationLanguage = normalizeNotificationLanguage(notification_language);
+      const messages = getNotificationMessages({ notification_language: notificationLanguage });
+      const result = await sendNotification({
+        tg_bot_token: effectiveToken,
       tg_chat_id: tg_chat_id || '',
       notification_webhook_enabled: normalizeBooleanSetting(notification_webhook_enabled),
       notification_webhook_url: notification_webhook_url || '',
@@ -740,8 +789,13 @@ async function handleSendTestNotificationAction({ data }) {
   }
 }
 
+// 后台请求体上限。保存设置、导入服务器等 payload 都在几十 KB 量级，
+// 512 KB 足够宽松，同时挡住超大 body 造成的解析开销。
+const ADMIN_MAX_REQUEST_BYTES = 512 * 1024;
+
 const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
   get_settings: handleGetSettingsAction,
+  get_install_secret: handleGetInstallSecretAction,
   start_theme_preview: handleStartThemePreviewAction,
   save_theme_options: handleSaveThemeOptionsAction,
   list: handleListAction,
@@ -751,7 +805,26 @@ const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
 
 export async function handleAdminAPI(request, env, sys, loadFullSettings = null, ctx = null) {
   try {
-    const data = await request.json();
+    // 后台接口的 action 在 body 里，所以没法像 /update 那样先鉴权再解析。
+    // 但仍然可以在解析之前限制 body 大小：否则一个未认证的请求只要带一个
+    // 超大 body，就能逼 Worker 把它解析一遍，白白吃掉 CPU。
+    // 限制按实际读取的字节数算，不依赖 Content-Length（chunked 请求可以伪造它）。
+    const parsed = await readJsonBodyWithLimit(request, ADMIN_MAX_REQUEST_BYTES);
+    if (!parsed.ok) {
+      if (parsed.reason === 'too_large') {
+        console.warn('[Admin] 413 Payload too large:', { limit: ADMIN_MAX_REQUEST_BYTES });
+        return new Response(JSON.stringify({
+          error: 'Payload too large',
+          code: 413,
+          text: 'payload_too_large'
+        }), {
+          status: 413,
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+        });
+      }
+      return createBadRequestResponse('invalidRequestBody');
+    }
+    const data = parsed.data || {};
 
     const publicActionHandler = PUBLIC_ADMIN_ACTION_HANDLERS[data.action];
     if (publicActionHandler) {
@@ -760,6 +833,19 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
 
     if (!await checkAuth(request, env, sys)) {
       return simpleAuthResponse();
+    }
+
+    // A bootstrap session (logged in with the default credentials on a fresh
+    // install) may only read what the panel needs to render the forced
+    // password form, and set that password. Everything else is refused until
+    // an independent password exists.
+    const authPayload = await getAuthPayload(request, env, sys);
+    if (authPayload && authPayload.scope === 'bootstrap') {
+      const BOOTSTRAP_READ_ACTIONS = new Set(['get_settings', 'list']);
+      const isPasswordChange = data.action === 'save_settings' && String(data.settings?.password || '').length > 0;
+      if (!BOOTSTRAP_READ_ACTIONS.has(data.action) && !isPasswordChange) {
+        return createErrorResponse(new AppError('bootstrapPasswordRequired', 403));
+      }
     }
 
     const authenticatedActionHandler = AUTHENTICATED_ADMIN_ACTION_HANDLERS[data.action];
@@ -810,9 +896,15 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         const effectiveWebhookUrl = settings.notification_webhook_url !== undefined
           ? settings.notification_webhook_url
           : sys?.notification_webhook_url;
-        const effectiveTgBotToken = settings.tg_bot_token !== undefined
-          ? settings.tg_bot_token
-          : sys?.tg_bot_token;
+        // 前端回传的是掩码，不是真值：校验要看库里那个真实的值。
+        // 管理员主动改过的话客户端传来的是新值（不是掩码），用那个。
+        const clientTgToken = settings.tg_bot_token !== undefined
+          ? String(settings.tg_bot_token || '').trim()
+          : '';
+        const storedTgToken = String(sys?.tg_bot_token || '').trim();
+        const effectiveTgBotToken = isMaskedSecretValue(clientTgToken)
+          ? storedTgToken
+          : (clientTgToken || storedTgToken);
         if (webhookEnabled) {
           if (!effectiveWebhookUrl || String(effectiveWebhookUrl).trim().length === 0) {
             return createBadRequestResponse('notificationWebhookUrlRequired');

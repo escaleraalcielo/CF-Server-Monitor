@@ -263,20 +263,109 @@ export function normalizeTrafficCorrection(value) {
   return isValidTrafficCorrection(value) ? Number(value) : 0;
 }
 
+// The single source of truth for the agent config channel. Each entry names
+// one key, the minimum negotiated schema version that may receive it, and how
+// its value is resolved. `buildAgentConfig` assembles the payload by walking
+// this list in order and `serializeAgentConfig` renders the same keys into the
+// body whose MD5 the agent verifies, so payload and body can never diverge.
+// Only inert configuration belongs here — never an update trigger (`update`,
+// `auto_update`), a download/proxy URL (`update_proxy`), a credential
+// (`secret`), or any key that could make an agent act. Entries flagged
+// `correction` travel only when the server row carries traffic corrections.
+const pingNodeField = (key, minVersion = AGENT_CONFIG_LEGACY_SCHEMA_VERSION) => ({
+  key,
+  minVersion,
+  resolve: ({ resolveNode }) => resolveNode(key)
+});
+
+const AGENT_CONFIG_FIELD_SPECS = [
+  {
+    key: 'collect_interval',
+    minVersion: AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
+    resolve: ({ server }) => storedInteger(server?.collect_interval, ALLOWED_COLLECT_INTERVALS, 0)
+  },
+  {
+    key: 'report_interval',
+    minVersion: AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
+    resolve: ({ server }, config) => {
+      const reportInterval = storedInteger(server?.report_interval, ALLOWED_REPORT_INTERVALS, 60);
+      return config.collect_interval > 0 && reportInterval < config.collect_interval
+        ? 60
+        : reportInterval;
+    }
+  },
+  {
+    key: 'reset_day',
+    minVersion: AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
+    resolve: ({ server }) => {
+      const resetNumber = typeof server?.reset_day === 'number'
+        ? server.reset_day
+        : Number(server?.reset_day);
+      return Number.isInteger(resetNumber) && resetNumber >= 0 && resetNumber <= 31
+        ? resetNumber
+        : 1;
+    }
+  },
+  {
+    key: 'schema_version',
+    minVersion: AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
+    resolve: ({ version }) => version
+  },
+  pingNodeField('custom_ct'),
+  pingNodeField('custom_cu'),
+  pingNodeField('custom_cm'),
+  pingNodeField('custom_bd'),
+  {
+    key: 'interface',
+    minVersion: AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
+    resolve: ({ server }) => sanitizeNetworkInterfaces(server?.interface || '')
+  },
+  pingNodeField('node_1', AGENT_CONFIG_EXTRA_NODES_SCHEMA_VERSION),
+  pingNodeField('node_2', AGENT_CONFIG_EXTRA_NODES_SCHEMA_VERSION),
+  pingNodeField('node_3', AGENT_CONFIG_EXTRA_NODES_SCHEMA_VERSION),
+  pingNodeField('node_4', AGENT_CONFIG_EXTRA_NODES_SCHEMA_VERSION),
+  {
+    key: 'connection_mode',
+    minVersion: AGENT_CONFIG_CONNECTION_MODE_SCHEMA_VERSION,
+    resolve: ({ server, wssEnabled }) => (wssEnabled
+      ? normalizeConnectionMode(server?.connection_mode) || CONNECTION_MODE_AUTO
+      : CONNECTION_MODE_HTTP)
+  },
+  {
+    key: 'wss_report_interval',
+    minVersion: AGENT_CONFIG_WSS_REPORT_INTERVAL_SCHEMA_VERSION,
+    resolve: ({ server, wssEnabled }, config) => {
+      if (config.connection_mode !== CONNECTION_MODE_AUTO || !wssEnabled) return undefined;
+      const wssReportInterval = normalizeWssReportInterval(server?.wss_report_interval);
+      if (config.collect_interval === 0 || config.collect_interval > wssReportInterval) {
+        config.collect_interval = wssReportInterval;
+      }
+      return wssReportInterval;
+    }
+  },
+  {
+    key: 'ping_mode',
+    minVersion: AGENT_CONFIG_PING_MODE_SCHEMA_VERSION,
+    resolve: ({ server }) => normalizePingMode(server?.ping_mode) || PING_MODE_TCP
+  },
+  {
+    key: 'rx_correction',
+    minVersion: AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
+    correction: true,
+    resolve: ({ server }) => normalizeTrafficCorrection(server?.rx_correction)
+  },
+  {
+    key: 'tx_correction',
+    minVersion: AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
+    correction: true,
+    resolve: ({ server }) => normalizeTrafficCorrection(server?.tx_correction)
+  }
+];
+
+export const AGENT_CONFIG_KEYS = Object.freeze(AGENT_CONFIG_FIELD_SPECS.map(spec => spec.key));
+
 export function buildAgentConfig(server, settings = null, schemaVersion = AGENT_CONFIG_SCHEMA_VERSION) {
   const version = normalizeSchemaVersion(schemaVersion);
-  const collectInterval = storedInteger(server?.collect_interval, ALLOWED_COLLECT_INTERVALS, 0);
-  let reportInterval = storedInteger(server?.report_interval, ALLOWED_REPORT_INTERVALS, 60);
-  const wssReportInterval = normalizeWssReportInterval(server?.wss_report_interval);
-  if (collectInterval > 0 && reportInterval < collectInterval) reportInterval = 60;
-
-  const resetNumber = typeof server?.reset_day === 'number'
-    ? server.reset_day
-    : Number(server?.reset_day);
-  const resetDay = Number.isInteger(resetNumber) && resetNumber >= 0 && resetNumber <= 31
-    ? resetNumber
-    : 1;
-
   const resolveNode = (field) => {
     const serverValue = server?.[field];
     const hasServerField = server && Object.prototype.hasOwnProperty.call(server, field);
@@ -287,90 +376,39 @@ export function buildAgentConfig(server, settings = null, schemaVersion = AGENT_
       : settings?.[field] || '';
     return sanitizePingNode(value);
   };
-  const customCt = resolveNode('custom_ct');
-  const customCu = resolveNode('custom_cu');
-  const customCm = resolveNode('custom_cm');
-  const customBd = resolveNode('custom_bd');
-  const node1 = resolveNode('node_1');
-  const node2 = resolveNode('node_2');
-  const node3 = resolveNode('node_3');
-  const node4 = resolveNode('node_4');
-  const networkInterface = sanitizeNetworkInterfaces(server?.interface || '');
-
-  const config = {
-    collect_interval: collectInterval,
-    report_interval: reportInterval,
-    reset_day: resetDay,
-    custom_ct: customCt,
-    custom_cu: customCu,
-    custom_cm: customCm,
-    custom_bd: customBd,
-    interface: networkInterface,
-    schema_version: version
+  const context = {
+    server,
+    version,
+    resolveNode,
+    wssEnabled: isWssReportConfigured(settings)
   };
 
-  if (version >= AGENT_CONFIG_EXTRA_NODES_SCHEMA_VERSION) {
-    config.node_1 = node1;
-    config.node_2 = node2;
-    config.node_3 = node3;
-    config.node_4 = node4;
+  const config = {};
+  for (const spec of AGENT_CONFIG_FIELD_SPECS) {
+    if (spec.correction || version < spec.minVersion) continue;
+    const value = spec.resolve(context, config);
+    if (value !== undefined) config[spec.key] = value;
   }
-
-  if (version >= AGENT_CONFIG_CONNECTION_MODE_SCHEMA_VERSION) {
-    const connectionMode = normalizeConnectionMode(server?.connection_mode) || CONNECTION_MODE_AUTO;
-    const wssEnabled = isWssReportConfigured(settings);
-    config.connection_mode = wssEnabled ? connectionMode : CONNECTION_MODE_HTTP;
-    if (
-      version >= AGENT_CONFIG_WSS_REPORT_INTERVAL_SCHEMA_VERSION &&
-      config.connection_mode === CONNECTION_MODE_AUTO &&
-      wssEnabled
-    ) {
-      config.wss_report_interval = wssReportInterval;
-      if (config.collect_interval === 0 || config.collect_interval > wssReportInterval) {
-        config.collect_interval = wssReportInterval;
-      }
-    }
-  }
-
-  if (version >= AGENT_CONFIG_PING_MODE_SCHEMA_VERSION) {
-    config.ping_mode = normalizePingMode(server?.ping_mode) || PING_MODE_TCP;
-  }
-
   return config;
 }
 
 export function serializeAgentConfig(config) {
-  let serialized = `collect_interval=${config.collect_interval}` +
-    `&report_interval=${config.report_interval}` +
-    `&reset_day=${config.reset_day}` +
-    `&schema_version=${config.schema_version}` +
-    `&custom_ct=${config.custom_ct}` +
-    `&custom_cu=${config.custom_cu}` +
-    `&custom_cm=${config.custom_cm}` +
-    `&custom_bd=${config.custom_bd}` +
-    `&interface=${config.interface}`;
-  if (Object.prototype.hasOwnProperty.call(config, 'node_1')) {
-    serialized += `&node_1=${config.node_1}` +
-      `&node_2=${config.node_2}` +
-      `&node_3=${config.node_3}` +
-      `&node_4=${config.node_4}`;
+  const parts = [];
+  for (const spec of AGENT_CONFIG_FIELD_SPECS) {
+    if (spec.correction) continue;
+    if (Object.prototype.hasOwnProperty.call(config, spec.key)) {
+      parts.push(`${spec.key}=${config[spec.key]}`);
+    }
   }
-  if (Object.prototype.hasOwnProperty.call(config, 'connection_mode')) {
-    serialized += `&connection_mode=${config.connection_mode}`;
-  }
-  if (Object.prototype.hasOwnProperty.call(config, 'wss_report_interval')) {
-    serialized += `&wss_report_interval=${config.wss_report_interval}`;
-  }
-  if (Object.prototype.hasOwnProperty.call(config, 'ping_mode')) {
-    serialized += `&ping_mode=${config.ping_mode}`;
-  }
-  return serialized;
+  return parts.join('&');
 }
 
 export function serializeCorrection(correction) {
   if (correction === null || correction === undefined) return '';
-  return `&rx_correction=${correction.rx_correction}` +
-    `&tx_correction=${correction.tx_correction}`;
+  return AGENT_CONFIG_FIELD_SPECS
+    .filter(spec => spec.correction)
+    .map(spec => `&${spec.key}=${correction[spec.key]}`)
+    .join('');
 }
 
 export async function describeAgentConfig(server, settings = null, schemaVersion = AGENT_CONFIG_SCHEMA_VERSION) {
@@ -378,13 +416,15 @@ export async function describeAgentConfig(server, settings = null, schemaVersion
   const serialized = serializeAgentConfig(config);
   const md5 = await md5Hash(serialized);
 
-  const hasCorrection = server?.rx_correction != null || server?.tx_correction != null;
+  const hasCorrection = AGENT_CONFIG_FIELD_SPECS.some(
+    spec => spec.correction && server?.[spec.key] != null
+  );
   let correction = null;
   if (hasCorrection) {
-    correction = {
-      rx_correction: normalizeTrafficCorrection(server.rx_correction),
-      tx_correction: normalizeTrafficCorrection(server.tx_correction)
-    };
+    correction = {};
+    for (const spec of AGENT_CONFIG_FIELD_SPECS) {
+      if (spec.correction) correction[spec.key] = spec.resolve({ server });
+    }
   }
 
   return { config, serialized, md5, correction };

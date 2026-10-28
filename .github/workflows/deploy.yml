@@ -42,24 +42,47 @@ jobs:
           node-version: '22'
 
       - name: 📦 Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: 🏗️ Build frontend assets
         run: npm run build:frontend
 
       - name: 📝 Create wrangler.toml
+        env:
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          CORS_ALLOWED_ORIGINS: ${{ secrets.CORS_ALLOWED_ORIGINS }}
         run: |
           cat > wrangler.toml << 'WEOF'
-          name = "server-monitor-pro"
+          # 必须与仓库里的 wrangler.toml 保持一致：worker 名字、域名路由、
+          # cron trigger 数量、Access 开关，任何一项不一致都会部署出**另一个**
+          # Worker，或把面板暴露到 workers.dev（不受 Access 应用管辖）。
+          name = "cf-server-monitor"
           main = "src/index.js"
           compatibility_date = "2024-12-01"
           compatibility_flags = ["nodejs_compat"]
 
+          keep_vars = true
+
+          # 面板只通过 Cloudflare Access 暴露。workers_dev 必须关闭：
+          # workers.dev 主机名不受本账号的 Access 应用管辖，��着就会多出一个
+          # 绕过 Access 的公开入口。注意：这两项必须是顶层键，不能放进 [vars]，
+          # 否则会被当成普通环境变量，部署照常成功但路由不会生效。
+          workers_dev = false
+
+          routes = [
+            { pattern = "monitor.cachorro-server.stream", custom_domain = true }
+          ]
+
+          [vars]
+          CORS_ALLOWED_ORIGINS = "CORS_ORIGINS_PLACEHOLDER"
+
           # 定时任务配置（UTC）
-          # - 每分钟：执行离线节点检测
-          # - 每小时：合并执行其他定时任务（每月1号数据清理、每月8号清理旧表、每天12点服务器到期检测）
+          # 每分钟：离线节点检测、资源告警
+          # 每小时（由 index.js 在 minute===0 时判定）：表轮换、旧表清理、到期检测
+          # 合并为单个 trigger：Workers Free 账号最多 5 个 cron trigger，
+          # 本账号其他 Worker 已占用 4 个，只剩一个名额。
           [triggers]
-          crons = ["*/1 * * * *", "0 * * * *"]
+          crons = ["*/1 * * * *"]
 
           [assets]
           directory = "./dist"
@@ -78,30 +101,54 @@ jobs:
           [[migrations]]
           tag = "v1"
           new_sqlite_classes = ["MetricsBroadcaster"]
-
-          [vars]
-          API_SECRET = "SECRET_PLACEHOLDER"
-          API_USER_NAME = "USER_NAME_PLACEHOLDER"
-          CORS_ALLOWED_ORIGINS = "CORS_ORIGINS_PLACEHOLDER"
           WEOF
 
-          # 替换占位符
-          sed -i "s|D1_PLACEHOLDER|${{ secrets.D1_DATABASE_ID }}|g" wrangler.toml
-          sed -i "s|SECRET_PLACEHOLDER|${{ secrets.API_SECRET }}|g" wrangler.toml
-          sed -i "s|USER_NAME_PLACEHOLDER|${{ secrets.API_USER_NAME }}|g" wrangler.toml
-          sed -i "s|CORS_ORIGINS_PLACEHOLDER|${{ secrets.CORS_ALLOWED_ORIGINS }}|g" wrangler.toml
+          # 替换占位符。用 Node 做纯字符串替换，而不是 sed：sed 的替换串里
+          # `|`、`&`、反引号和 `$(...)` 都有特殊含义，会破坏替换甚至在
+          # runner 上执行命令。值经环境变量传入，不经过 shell 解析。
+          node -e '
+            const fs = require("fs");
+            let t = fs.readFileSync("wrangler.toml", "utf8");
+            const pairs = [
+              ["D1_PLACEHOLDER", process.env.D1_DATABASE_ID],
+              ["CORS_ORIGINS_PLACEHOLDER", process.env.CORS_ALLOWED_ORIGINS],
+            ];
+            for (const [k, v] of pairs) {
+              if (!v) { console.error(`missing value for ${k}`); process.exit(1); }
+              t = t.split(k).join(v);
+            }
+            fs.writeFileSync("wrangler.toml", t);
+          '
 
-          echo "✅ wrangler.toml 已生成"
+          # 守卫：D1 必须是 server-monitor-db。id 指向别的库时，面板会读写
+          # 另一份数据，而线上的 server-monitor-db 看起来"没更新"——很难排查。
+          ID=$(grep -E '^database_id' wrangler.toml | cut -d'"' -f2)
+          NAME=$(npx --yes wrangler@4.136.1 d1 info "$ID" --json 2>/dev/null \
+                 | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).name||"")}catch(e){console.log("")}})')
+          if [ "$NAME" != "server-monitor-db" ]; then
+            echo "❌ D1 id $ID 对应的数据库名是 '$NAME'，不是 server-monitor-db —— 拒绝部署"
+            exit 1
+          fi
+          echo "✅ wrangler.toml 已生成，D1 已确认指向 server-monitor-db"
+          echo "   （API_SECRET / API_USER_NAME 走加密 Secret，不在 [vars] 里）"
 
       # wrangler v4 的 `deploy` 会自动根据 wrangler.toml 中的 [[durable_objects.bindings]]
       # 声明创建 DO namespace（幂等：已存在则跳过），无需单独命令。
       # 前提：MetricsBroadcaster 类必须从 index.js 导出（已通过 src/index.js 实现）。
       - name: 🚀 Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
+        env:
+          API_SECRET: ${{ secrets.API_SECRET }}
+          API_USER_NAME: ${{ secrets.API_USER_NAME }}
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           wranglerVersion: '4'
+          # 这些走 `wrangler secret put`，在 Worker 里是加密 Secret，不会
+          # 出现在 wrangler.toml、[vars] 或部署产物里。
+          secrets: |
+            API_SECRET
+            API_USER_NAME
           command: deploy
 
       - name: ✅ Deployment Success

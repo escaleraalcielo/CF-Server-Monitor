@@ -402,6 +402,8 @@ export default {
   confirmPassword: '確認密碼',
   apiSecretTip: '伺服器回報使用的 API_SECRET 仍使用環境變數，不受此處密碼設定影響。',
   passwordRequired: '尚未設定管理員密碼，請先設定密碼再儲存。',
+  apiSecretNotConfigured: '伺服器回報密鑰未設定。產生安裝命令前請先設定 API_SECRET。',
+  installSecretUnavailable: '無法取得回報密鑰。安裝命令需要它，請重試。',
   passwordMismatch: '兩次輸入的密碼不一致',
   usernameRequired: '使用者名稱不能為空',
   securitySettings: '安全設定',

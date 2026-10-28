@@ -402,6 +402,8 @@ export default {
   confirmPassword: 'Confirm Password',
   apiSecretTip: 'The API_SECRET for server reporting still uses the environment variable, regardless of password settings here.',
   passwordRequired: 'No admin password is configured. Please set one before saving.',
+  apiSecretNotConfigured: 'The server ingest secret is not configured. Set API_SECRET before generating install commands.',
+  installSecretUnavailable: 'Could not load the ingest secret. The install command needs it - please try again.',
   passwordMismatch: 'Passwords do not match',
   usernameRequired: 'Username is required',
   securitySettings: 'Security Settings',

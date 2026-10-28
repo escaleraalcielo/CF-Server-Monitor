@@ -454,6 +454,19 @@ async function evaluateResourceAlertRules(stub, ruleRequests) {
 }
 
 async function fetchWithRetry(url, options, retries = NOTIFICATION_MAX_RETRIES) {
+  // 通知目标的 URL 都是管理员自己填的，但没必要让 data:、file: 之类的
+  // scheme 走到 fetch。放在这里而不是每个渠道各写一份：新增渠道时
+  // 不会再漏掉，而且没有哪条路径能绕过。
+  // （SMTP 走的是 cloudflare-smtp 的 cloudflare:sockets，不经过这里。）
+  let parsed;
+  try {
+    parsed = new URL(String(url));
+  } catch (_) {
+    throw new Error('invalid notification url');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('unsupported notification url scheme');
+  }
   for (let i = 0; i < retries; i++) {
     try {
       const response = await fetch(url, options);

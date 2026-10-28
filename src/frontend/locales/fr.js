@@ -402,6 +402,8 @@ export default {
   confirmPassword: 'Confirmer le mot de passe',
   apiSecretTip: 'L’API_SECRET pour le rapport des serveurs utilise toujours la variable d’environnement, quel que soit le mot de passe défini ici.',
   passwordRequired: 'Aucun mot de passe admin n’est configuré. Veuillez en définir un avant d’enregistrer.',
+  apiSecretNotConfigured: 'Le secret d’ingestion du serveur n’est pas configuré. Définissez API_SECRET avant de générer les commandes d’installation.',
+  installSecretUnavailable: 'Impossible de charger le secret d’ingestion. La commande d’installation en a besoin — réessayez.',
   passwordMismatch: 'Mots de passe différents',
   usernameRequired: 'Le nom d’utilisateur est requis',
   securitySettings: 'Paramètres de sécurité',

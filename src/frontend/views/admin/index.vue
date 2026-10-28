@@ -993,10 +993,10 @@ const settings = ref({
   custom_cu: '',
   custom_cm: '',
   custom_bd: '',
-  custom_ct_name: '电信',
-  custom_cu_name: '联通',
-  custom_cm_name: '移动',
-  custom_bd_name: 'BGP',
+  custom_ct_name: '',
+  custom_cu_name: '',
+  custom_cm_name: '',
+  custom_bd_name: '',
   theme_url: '',
   csp_static: '',
   csp_api: ''
@@ -1274,6 +1274,11 @@ const handleLogin = async () => {
     syncApiIndexQuery()
     clearTurnstile()
     turnstileVerified.value = hasSharedTurnstileVerified()
+    // A bootstrap session may only set a password: force that form open.
+    if (result.data && result.data.bootstrap) {
+      changeAdminPassword.value = true
+      activeTab.value = 'settings'
+    }
     await Promise.all([
       loadSettings(),
       loadServers(),
@@ -1437,6 +1442,7 @@ const loadSettings = async () => {
         turnstile_secret_key: settingsData.turnstile_secret_key || '',
         cloudflare_account_id: settingsData.cloudflare_account_id || '',
         cloudflare_token: settingsData.cloudflare_token || '',
+        secret_mask: settingsData.secret_mask || '',
         jwt_secret: '',
         username: settingsData.username || '',
         password_configured: settingsData.password_configured === true,
@@ -1447,10 +1453,10 @@ const loadSettings = async () => {
         custom_cm: settingsData.custom_cm || '',
         custom_bd: settingsData.custom_bd || '',
         node_1: settingsData.node_1 || '', node_2: settingsData.node_2 || '', node_3: settingsData.node_3 || '', node_4: settingsData.node_4 || '',
-        custom_ct_name: settingsData.custom_ct_name || '电信',
-        custom_cu_name: settingsData.custom_cu_name || '联通',
-        custom_cm_name: settingsData.custom_cm_name || '移动',
-        custom_bd_name: settingsData.custom_bd_name || 'BGP',
+        custom_ct_name: settingsData.custom_ct_name || '',
+        custom_cu_name: settingsData.custom_cu_name || '',
+        custom_cm_name: settingsData.custom_cm_name || '',
+        custom_bd_name: settingsData.custom_bd_name || '',
         node_1_name: settingsData.node_1_name || 'Node 1', node_2_name: settingsData.node_2_name || 'Node 2', node_3_name: settingsData.node_3_name || 'Node 3', node_4_name: settingsData.node_4_name || 'Node 4',
         theme_url: settingsData.theme_url || '',
         csp_static: settingsData.csp_static || '',
@@ -1458,7 +1464,8 @@ const loadSettings = async () => {
       }
       applyMikusThemeOptions(settingsData.theme_options)
       changeAdminPassword.value = !settings.value.password_configured || !String(settings.value.username || '').trim()
-      apiSecret.value = data.api_secret || ''
+      // 上报密钥（api_secret）不再随设置一起下发；打开安装命令面板时按需获取。
+      apiSecret.value = ''
       // 只有已保存到服务端的自动发现开关才提供复制安装命令，避免复制出当前并未生效的命令
       savedAutoDiscovery.value = settings.value.auto_discovery
     }
@@ -1670,6 +1677,11 @@ const saveSettings = async () => {
       clearAdminPasswordInputs()
       changeAdminPassword.value = false
       settings.value.jwt_secret = ''
+      // The bootstrap session has served its purpose: an independent password
+      // now exists, so the panel is no longer restricted to the password form.
+      if (localStorage.getItem(STORAGE.BOOTSTRAP_SESSION)) {
+        localStorage.removeItem(STORAGE.BOOTSTRAP_SESSION)
+      }
       loadSettings()
     } else {
       saveResult.value = { success: false, error: getMessage(result.error) || 'fail' }
@@ -1745,9 +1757,22 @@ const addServer = async () => {
   }
 }
 
-const getInstallCommand = (serverId) => {
-  const HOST = selectedApiBase.value
-  return `curl -sL ${HOST}/install.sh | bash -s install -id=${serverId} -secret='${apiSecret.value}' -url=${HOST}/update`
+// 上报密钥按需获取：只有管理员打开安装命令面板时才向服务端要，
+// 面板关闭后立刻丢弃。常规设置响应里不再携带这个共享密钥。
+const fetchInstallSecret = async () => {
+  if (apiSecret.value) return apiSecret.value
+  try {
+    const result = await adminApiForSite({ action: 'get_install_secret' })
+    if (result.error) return ''
+    apiSecret.value = result.data?.api_secret || ''
+    return apiSecret.value
+  } catch (_) {
+    return ''
+  }
+}
+
+const clearInstallSecret = () => {
+  apiSecret.value = ''
 }
 
 const resolveServerPingNode = (server, field) => {
@@ -1784,7 +1809,7 @@ const getUninstallCommand = () => {
   return `curl -fsSL '${HOST}/uninstall.sh' | sh -s`
 }
 
-const copyCmd = (serverId) => {
+const copyCmd = async (serverId) => {
   const server = servers.value.find(s => s.id === serverId)
   copyServerId.value = serverId
   currentServerName.value = server?.name || ''
@@ -1825,6 +1850,9 @@ const copyCmd = (serverId) => {
   txCorrection.value = server?.tx_correction ?? ''
   autoUpdate.value = server?.auto_update === '1' || server?.auto_update === 1 || server?.auto_update === true
   copiedCmd.value = false
+  // 先拿到上报密钥再打开面板：否则首帧渲染出来的安装命令里
+  // -secret 会是空串，管理员复制到机器上就是一条坏命令。
+  await fetchInstallSecret()
   showCopyModal.value = true
 }
 
@@ -1897,6 +1925,9 @@ const buildInstallAsCfsmCommand = (command, runStep) => {
 }
 
 const getCustomInstallCommand = () => {
+  // 没有上报密钥就不生成命令：生成 -secret='' 的命令比没有命令更糟，
+  // 管理员会把它原样粘到机器上。
+  if (!apiSecret.value) return ''
   const HOST = selectedApiBase.value
   const autoUpdateFlag = autoUpdate.value ? 1 : 0
   const proxy = installGhProxy.value.trim()
@@ -1949,6 +1980,8 @@ const getCustomInstallCommand = () => {
 // 自动发现模式下安装命令不带 -id：Agent 首次上报时由服务端自动创建服务器。
 // name 留空时服务端回退到请求来源 IP；安装用户、代理、版本、名称与自动更新仅影响本次生成的命令。
 const buildAutoDiscoveryCommand = ({ targetOs: os = 'linux', installMode: mode = 'current-user', ghProxy = '', name = '', version = '', autoUpdate = false } = {}) => {
+  // 同上：没有密钥就不生成命令。
+  if (!apiSecret.value) return ''
   const HOST = selectedApiBase.value
   const proxy = String(ghProxy || '').trim()
   const agentVersion = String(version || '').trim()
@@ -1997,22 +2030,36 @@ const getAutoDiscoveryInstallCommand = () => buildAutoDiscoveryCommand({
   autoUpdate: autoDiscoveryAutoUpdate.value
 })
 
-const openAutoDiscoveryModal = () => {
+const openAutoDiscoveryModal = async () => {
   if (!savedAutoDiscovery.value) {
     alertMessage.value = trans.value.autoAddDisabledTip
     return
   }
 
   autoDiscoveryCopied.value = false
+  // 同样先取密钥再开面板，避免复制到 -secret='' 的坏命令。
+  await fetchInstallSecret()
   showAutoDiscoveryModal.value = true
 }
 
 const closeAutoDiscoveryModal = () => {
   showAutoDiscoveryModal.value = false
+  clearInstallSecret()
 }
 
 const copyAutoDiscoveryCmd = async () => {
-  const copied = await copyTextToClipboard(getAutoDiscoveryInstallCommand())
+  // 同上：没有密钥就不复制。
+  if (!apiSecret.value) await fetchInstallSecret()
+  if (!apiSecret.value) {
+    alertMessage.value = trans.value.installSecretUnavailable
+    return
+  }
+  const cmd = getAutoDiscoveryInstallCommand()
+  if (!cmd) {
+    alertMessage.value = trans.value.installSecretUnavailable
+    return
+  }
+  const copied = await copyTextToClipboard(cmd)
   if (!copied) {
     alertMessage.value = trans.value.httpsRequired
     return
@@ -2025,7 +2072,18 @@ const copyAutoDiscoveryCmd = async () => {
 }
 
 const copyCustomCmd = async () => {
+  // 复制前再确认一次密钥在手上：拿不到就别复制，
+  // 免得把 -secret='' 的命令粘到机器上。
+  if (!apiSecret.value) await fetchInstallSecret()
+  if (!apiSecret.value) {
+    alertMessage.value = trans.value.installSecretUnavailable
+    return
+  }
   const cmd = getCustomInstallCommand()
+  if (!cmd) {
+    alertMessage.value = trans.value.installSecretUnavailable
+    return
+  }
   const copied = await copyTextToClipboard(cmd)
   if (!copied) {
     alertMessage.value = trans.value.httpsRequired
@@ -2040,12 +2098,14 @@ const copyCustomCmd = async () => {
 
 const closeCopyModal = () => {
   showCopyModal.value = false
+  clearInstallSecret()
 }
 
 const openEditModalFromCopy = () => {
   const server = servers.value.find(s => s.id === copyServerId.value)
   if (server) {
     showCopyModal.value = false
+    clearInstallSecret()
     openEditModal(server)
   }
 }
@@ -2550,8 +2610,8 @@ const queryD1Usage = async () => {
   try {
     const result = await adminApiForSite({
       action: 'd1_usage',
-      cloudflare_account_id: settings.value.cloudflare_account_id,
-      cloudflare_token: settings.value.cloudflare_token
+      cloudflare_account_id: settings.value.cloudflare_account_id
+      // cloudflare_token 不再回传：前端只有掩码，服务端用自己的库中副本。
     })
     if (!result.error) {
       d1UsageResult.value = result.data

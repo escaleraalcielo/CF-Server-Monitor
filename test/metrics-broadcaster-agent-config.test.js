@@ -15,10 +15,16 @@ globalThis.WebSocketRequestResponsePair = class WebSocketRequestResponsePair {
 };
 
 function makeBroadcaster(webSockets = [], env = { DB: {} }) {
+  const accepted = webSockets;
   return new MetricsBroadcaster({
     setWebSocketAutoResponse() {},
     getWebSockets() {
-      return webSockets;
+      return accepted;
+    },
+    // Mirrors the runtime: a socket accepted through the hibernation API stays
+    // in state.getWebSockets() and survives the object being evicted.
+    acceptWebSocket(ws) {
+      accepted.push(ws);
     },
     storage: {
       async get() {
@@ -27,6 +33,31 @@ function makeBroadcaster(webSockets = [], env = { DB: {} }) {
       async put() {}
     }
   }, env);
+}
+
+// A WebSocket mock with the same attachment semantics as the runtime:
+// serializeAttachment/deserializeAttachment round-trip through storage, so
+// the value handed back is a copy rather than a live reference.
+function makeHibernationSocket() {
+  let attachment = null;
+  return {
+    sent: [],
+    closed: false,
+    send(message) {
+      this.sent.push(message);
+    },
+    close() {
+      this.closed = true;
+    },
+    serializeAttachment(value) {
+      attachment = value === undefined || value === null
+        ? null
+        : JSON.parse(JSON.stringify(value));
+    },
+    deserializeAttachment() {
+      return attachment === null ? null : JSON.parse(JSON.stringify(attachment));
+    }
+  };
 }
 
 function makeSettingsDb(settingsSource) {
@@ -262,7 +293,7 @@ test('Durable Object rechecks Agent WSS schedule before accepting a socket', asy
   const body = await response.json();
   assert.equal(body.text, 'wss_schedule_inactive');
   assert.equal(body.connection_mode, 'http');
-  assert.equal(broadcaster.standardAgentWebSocketCount, 0);
+  assert.equal(broadcaster._getAgentReportWebSockets().length, 0);
 });
 
 test('Durable Object rejects Agent WSS upgrade when report is disabled', async () => {
@@ -285,7 +316,7 @@ test('Durable Object rejects Agent WSS upgrade when report is disabled', async (
   assert.equal(body.code, 409);
   assert.equal(body.text, 'wss_disabled');
   assert.equal(body.connection_mode, 'http');
-  assert.equal(broadcaster.standardAgentWebSocketCount, 0);
+  assert.equal(broadcaster._getAgentReportWebSockets().length, 0);
 });
 
 test('WSS agent config state only requests ack for fields in current report', () => {
@@ -300,48 +331,243 @@ test('WSS agent config state only requests ack for fields in current report', ()
   );
 });
 
-test('WSS agent standard WebSocket adapter preserves attachment state', async () => {
+test('WSS agent socket is accepted through the hibernation API and keeps its attachment', async () => {
   const broadcaster = makeBroadcaster();
-  const listeners = {};
-  const sent = [];
+  const server = makeHibernationSocket();
+
   let accepted = false;
-  const server = {
-    accept() {
-      accepted = true;
-    },
-    send(message) {
-      sent.push(message);
-    },
-    close() {},
-    addEventListener(type, handler) {
-      listeners[type] = handler;
+  server.accept = () => {
+    accepted = true;
+  };
+
+  const ws = broadcaster._acceptAgentReportWebSocket(server, {
+    kind: 'agent-report',
+    authenticated: false,
+    serverId: ''
+  });
+
+  // The standard WebSocket API keeps the object resident for the lifetime of
+  // the connection, which is billed as duration. The hibernation API is what
+  // lets the object sleep, so it must be the one used here.
+  assert.equal(accepted, false, 'the standard WebSocket API must not be used for agent sockets');
+  assert.equal(ws, server);
+  assert.equal(broadcaster._getAgentReportWebSockets().length, 1);
+  assert.equal(ws.deserializeAttachment().kind, 'agent-report');
+  assert.equal(ws.deserializeAttachment().authenticated, false);
+});
+
+test('WSS agent socket stays discoverable after the object is re-created', async () => {
+  // The runtime re-runs the constructor when a hibernated object is woken.
+  // Nothing about the agent connection may live only in memory, so the socket
+  // has to be found through state.getWebSockets() alone.
+  const accepted = [];
+  const server = makeHibernationSocket();
+  const first = makeBroadcaster(accepted);
+  first._acceptAgentReportWebSocket(server, {
+    kind: 'agent-report',
+    authenticated: true,
+    serverId: 'server-1'
+  });
+
+  const second = makeBroadcaster(accepted);
+  const found = second._getAgentReportWebSockets();
+  assert.equal(found.length, 1);
+  assert.equal(found[0], server);
+  assert.equal(found[0].deserializeAttachment().serverId, 'server-1');
+});
+
+test('WSS agent message updates are persisted on the socket attachment', async () => {
+  const broadcaster = makeBroadcaster();
+  const server = makeHibernationSocket();
+  const ws = broadcaster._acceptAgentReportWebSocket(server, { kind: 'agent-report' });
+
+  // Mirrors what the message handler does: read the attachment, change it,
+  // write it back. The runtime keeps the value, so a later wake-up sees it.
+  const attachment = ws.deserializeAttachment() || {};
+  ws.serializeAttachment({ ...attachment, authenticated: true, serverId: 'server-1' });
+
+  assert.equal(ws.deserializeAttachment().serverId, 'server-1');
+  assert.equal(ws.deserializeAttachment().authenticated, true);
+});
+
+test('WSS agent keeps working across a hibernation wake-up', async () => {
+  // The runtime re-creates the object when a hibernated one is woken, so
+  // everything the message path needs has to survive in the socket attachment
+  // or in Durable Object storage - never only in instance fields.
+  const historyWrites = [];
+  const serverRow = {
+    id: 'server-hibernate-1',
+    name: 'srv',
+    secret: 'test-secret',
+    is_hidden: 0,
+    history_partition_id: 7
+  };
+  const db = {
+    prepare(sql) {
+      const trimmed = String(sql).trim();
+      const isServerSelect = /from\s+servers/i.test(trimmed);
+      return {
+        bind(...args) {
+          return {
+            async run() {
+              if (/insert\s+into\s+metrics_history/i.test(trimmed)) {
+                historyWrites.push(args);
+              }
+              return { success: true, meta: { changes: 1 } };
+            },
+            async first() {
+              return isServerSelect ? serverRow : null;
+            }
+          };
+        },
+        async first() {
+          return isServerSelect ? serverRow : null;
+        },
+        async run() {
+          if (/insert\s+into\s+metrics_history/i.test(trimmed)) {
+            historyWrites.push([]);
+          }
+          return { success: true, meta: { changes: 1 } };
+        }
+      };
     }
   };
 
-  let finish;
-  const handled = new Promise(resolve => {
-    finish = resolve;
+  const env = { DB: db, API_SECRET: 'test-secret' };
+  const accepted = [];
+  const server = makeHibernationSocket();
+  const sent = [];
+  server.send = message => sent.push(JSON.parse(message));
+
+  const first = makeBroadcaster(accepted, env);
+  first._acceptAgentReportWebSocket(server, {
+    kind: 'agent-report',
+    authenticated: false,
+    serverId: '',
+    historyPartitionId: 0,
+    reportIntervalMs: 60_000,
+    lastD1WriteTs: 0
   });
-  broadcaster._handleAgentReportMessage = async (ws, rawMessage, attachment) => {
-    assert.equal(rawMessage, '{"metrics":{}}');
-    assert.equal(attachment.kind, 'agent-report');
-    ws.serializeAttachment({ ...attachment, authenticated: true, serverId: 'server-1' });
-    ws.send('ok');
-    finish();
-  };
 
-  const ws = broadcaster._acceptStandardAgentWebSocket(server, { kind: 'agent-report' });
-  assert.equal(accepted, true);
-  assert.equal(broadcaster.standardAgentWebSocketCount, 1);
+  const report = JSON.stringify({
+    type: 'update',
+    payload: {
+      id: 'server-hibernate-1',
+      secret: 'test-secret',
+      timestamp: Date.now(),
+      metrics: { cpu: 12, ram_total: 100, ram_used: 40, net_in_speed: 1024 }
+    }
+  });
 
-  listeners.message({ data: '{"metrics":{}}' });
-  await handled;
+  await first.webSocketMessage(server, report);
 
-  assert.equal(ws.deserializeAttachment().serverId, 'server-1');
-  assert.deepEqual(sent, ['ok']);
+  // The socket is now authenticated and the write cadence is recorded on it.
+  const attachment = server.deserializeAttachment();
+  assert.equal(attachment.authenticated, true);
+  assert.equal(attachment.serverId, 'server-hibernate-1');
+  assert.ok(Number(attachment.lastD1WriteTs) > 0, 'the write timestamp must be on the attachment');
+  assert.equal(historyWrites.length, 1, 'the first report writes one history row');
 
-  listeners.close();
-  assert.equal(broadcaster.standardAgentWebSocketCount, 0);
+  // The object is evicted and re-created, exactly as the runtime does when a
+  // hibernated object is woken.
+  const second = makeBroadcaster(accepted, env);
+  assert.equal(second.agentHistoryWrites.size, 0, 'instance state starts empty after a wake-up');
+  assert.equal(second._getAgentReportWebSockets().length, 1, 'the socket is rediscovered from state');
+
+  // A follow-up report that carries no credentials: the attachment must be
+  // enough to keep the connection authenticated.
+  await second.webSocketMessage(server, JSON.stringify({
+    type: 'update',
+    payload: {
+      timestamp: Date.now(),
+      metrics: { cpu: 14, ram_total: 100, ram_used: 45, net_in_speed: 2048 }
+    }
+  }));
+
+  assert.equal(historyWrites.length, 1, 'the write cadence survives the wake-up');
+  assert.ok(
+    sent.some(message => message.type === 'ack'),
+    'the agent is still acknowledged after the wake-up'
+  );
+});
+
+test('WSS agent reconnect does not write an extra history row', async () => {
+  // A reconnecting agent gets a fresh attachment that does not carry the last
+  // write timestamp, so the timestamp has to come from Durable Object storage
+  // - otherwise every reconnect would write one more history row.
+  const storageData = new Map();
+  const accepted = [];
+  const server = makeHibernationSocket();
+  const first = makeBroadcaster(accepted, { DB: { prepare: () => ({ bind: () => ({ run: async () => ({ success: true }), first: async () => null }) }) } });
+  first.state.storage.get = async key => storageData.get(key) ?? null;
+  first.state.storage.put = async (key, value) => { storageData.set(key, value); };
+
+  const ws = first._acceptAgentReportWebSocket(server, {
+    kind: 'agent-report',
+    authenticated: true,
+    serverId: 'server-reconnect-1',
+    reportIntervalMs: 60_000
+  });
+
+  const persistedAt = Date.now();
+  first.agentHistoryWriteState = { 'server-reconnect-1': persistedAt };
+  first._persistAgentHistoryWriteState(first.agentHistoryWriteState);
+  await new Promise(resolve => setTimeout(resolve, 0));
+
+  assert.ok(storageData.has('agent_history_write_state_v1'));
+
+  // A brand new socket, as after a reconnect: the attachment knows nothing.
+  const reconnected = makeHibernationSocket();
+  const second = makeBroadcaster(accepted, { DB: { prepare: () => ({ bind: () => ({ run: async () => ({ success: true }), first: async () => null }) }) } });
+  second.state.storage.get = async key => storageData.get(key) ?? null;
+  second.state.storage.put = async (key, value) => { storageData.set(key, value); };
+  await second._loadAgentHistoryWriteState();
+
+  const result = await second._persistAgentHistoryIfDue(reconnected, {
+    kind: 'agent-report',
+    serverId: 'server-reconnect-1',
+    reportIntervalMs: 60_000,
+    lastD1WriteTs: 0
+  }, {
+    serverId: 'server-reconnect-1',
+    historyPartitionId: 7,
+    metrics: { cpu: 10 },
+    regionCode: 'US',
+    timestamp: persistedAt + 1_000,
+    agentVersion: 'test',
+    reportIntervalMs: 60_000
+  });
+
+  assert.equal(result.persisted, false, 'the stored write timestamp must suppress a duplicate write');
+});
+
+test('resource alert sampling window is restored after a hibernation wake-up', async () => {
+  // The window lives in an instance field, which is lost when the object is
+  // re-created. If it is not restored, alert samples are never collected again.
+  const storageData = new Map();
+  const accepted = [];
+  const makeState = () => ({
+    setWebSocketAutoResponse() {},
+    getWebSockets() { return accepted; },
+    acceptWebSocket(ws) { accepted.push(ws); },
+    storage: {
+      async get(key) { return storageData.get(key) ?? null; },
+      async put(key, value) { storageData.set(key, value); }
+    }
+  });
+
+  const cron = new MetricsBroadcaster(makeState(), { DB: {} });
+  cron._activateResourceAlertCache(Date.now());
+  await new Promise(resolve => setTimeout(resolve, 0));
+
+  assert.ok(storageData.has('resource_alert_cache_state_v1'), 'the window is persisted when the cron activates it');
+
+  // A fresh object, as after a wake-up: the instance field is empty.
+  const woken = new MetricsBroadcaster(makeState(), { DB: {} });
+  assert.equal(woken._shouldCacheResourceAlertSamples(), false, 'a fresh object has no window');
+
+  await woken._restoreResourceAlertCacheState();
+  assert.equal(woken._shouldCacheResourceAlertSamples(), true, 'the window is restored from storage');
 });
 
 test('WSS agent ack suggests configured realtime or idle report interval', () => {
@@ -488,6 +714,7 @@ test('WSS agent context asks the agent to retry when lookup throws before auth',
   const sent = [];
   const closed = [];
   const broadcaster = makeBroadcaster([], {
+    API_SECRET: 'test-secret',
     DB: {
       prepare() {
         return {
@@ -515,7 +742,8 @@ test('WSS agent context asks the agent to retry when lookup throws before auth',
     authenticated: false,
     serverId: ''
   }, {
-    id: 'degraded-server-2'
+    id: 'degraded-server-2',
+    secret: 'test-secret'
   });
 
   assert.equal(context, null);
