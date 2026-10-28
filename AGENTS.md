@@ -116,6 +116,36 @@ The serialized output is **byte-identical** to the pre-refactor implementation f
 configs, so the MD5 a deployed agent verifies does not change and no agent re-applies its
 config.
 
+### The traffic baseline rebaselines itself when the counter identity changes
+
+Agents report lifetime byte counters, and the panel derives usage from the difference between
+consecutive readings. That difference is only meaningful while the counter is the same
+counter, so the baseline is rebaselined whenever that stops being true.
+
+The baseline lives in the `servers.traffic_baseline` column (JSON), so it survives a Durable
+Object restart and a Worker cold start. `src/utils/trafficBaseline.js` holds the state
+machine; `stepTrafficBaseline()` is pure — same input, same decision — and the D1 read/write
+lives in `loadTrafficBaseline()` / `saveTrafficBaseline()`.
+
+Rebaseline reasons, in the order they are checked:
+
+| Reason | Trigger |
+|---|---|
+| `reset_day` | the billing period rolled over — the existing behaviour, unchanged |
+| `boot_id_changed` | the agent reported a different boot id |
+| `interface_digest_changed` | the agent reported a different set of counted interfaces |
+| `counter_regression` | the counter went **backwards** — a reboot, with no agent change at all |
+
+**A rebaseline does not wipe the period's usage.** The amount accumulated so far
+(`carry + (last - baseline)`) is carried into the new baseline, so a machine that reboots
+mid-period keeps its traffic for that period and does not report its counters twice.
+
+The two agent-side fields are **optional**. `boot_id` and `interface_digest` are read when
+present and ignored when absent — which is the case for every agent in production today,
+since there is no `cfsm-agent` fork that reports them. Regression detection covers the
+reboot case on its own, so the feature works today and gets sharper when the agent side
+lands.
+
 ### Where heavy work belongs: the DO has 30 s, a Worker request has no clean ceiling
 
 Measured on this account (Workers Free) on 2026-10-28 with a throwaway probe worker, burning
