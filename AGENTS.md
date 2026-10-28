@@ -85,11 +85,14 @@ which starts from an **empty object** and copies only the fields named in
 `PUBLIC_SERVER_FIELDS`. A field added to the `servers` table later is therefore private by
 default, instead of being published until somebody remembers to delete it.
 
-- The machine hostname, the private note, tags, price/billing/expiry, the server id, the agent
-  configuration and the traffic corrections are never public.
+- The machine hostname, the private note, tags, price/billing/expiry, the agent configuration
+  and the traffic corrections are never public, and the server id is not in the public
+  payload.
 - `ip_v4` / `ip_v6` appear only as a reachability flag (`'1'` / `'0'`).
 - A server the operator marked private does not appear in the public list at all.
-- The live-update frames in a public response carry no `serverId`.
+- The HTTP public response's live-update frames carry no `serverId`. The live WebSocket
+  stream still identifies a server by its internal id — a UUID, not a host name or an address
+  — and its IP fields are masked to a reachability flag there as well.
 
 The authenticated admin view is unaffected: it still returns every field.
 
