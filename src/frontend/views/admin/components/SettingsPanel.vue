@@ -1214,8 +1214,11 @@ const notificationChannel = computed({
       } else if (isMaskedToken(props.settings.tg_bot_token)) {
         // 库里已配置 SMTP，但服务端只给了掩码：表单留空，
         // 不去解析掩码（否则会把 '••••' 解析成主机/账号再写回去）。
+        // smtpTokenApplied 必须保持 false：它是 true 时 syncSmtpToken 会跳过
+        // 完整性检查，把空表单序列化成 '' 写回共享字段，
+        // 下一次保存就会把库里的真实 SMTP 配置清掉。
         Object.assign(smtpConfig, defaultSmtpConfig())
-        smtpTokenApplied.value = true
+        smtpTokenApplied.value = false
       } else {
         Object.assign(smtpConfig, defaultSmtpConfig())
         smtpTokenApplied.value = false
@@ -1245,10 +1248,11 @@ watch(smtpConfig, () => {
 watch(() => props.settings.tg_bot_token, (token) => {
   if (isSmtpToken(token)) {
     smtpChannelActive.value = true
-    smtpTokenApplied.value = true
     // 掩码只说明"库里配了 SMTP"，不是可解析的值：
     // 解析它会把 '••••' 当成主机/账号/密码，再被 syncSmtpToken 写回去，
-    // 覆盖掉库里的真实配置。
+    // 覆盖掉库里的真实配置。smtpTokenApplied 同样保持 false，
+    // 这样管理员没填完表单前 syncSmtpToken 不会写回共享字段。
+    smtpTokenApplied.value = !isMaskedToken(token)
     if (isMaskedToken(token)) return
     if (buildSmtpToken(smtpConfig) !== String(token).trim()) {
       applySmtpToken(token)

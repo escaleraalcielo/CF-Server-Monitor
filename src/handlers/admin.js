@@ -872,9 +872,15 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         const effectiveWebhookUrl = settings.notification_webhook_url !== undefined
           ? settings.notification_webhook_url
           : sys?.notification_webhook_url;
-        const effectiveTgBotToken = settings.tg_bot_token !== undefined
-          ? settings.tg_bot_token
-          : sys?.tg_bot_token;
+        // 前端回传的是掩码，不是真值：校验要看库里那个真实的值。
+        // 管理员主动改过的话客户端传来的是新值（不是掩码），用那个。
+        const clientTgToken = settings.tg_bot_token !== undefined
+          ? String(settings.tg_bot_token || '').trim()
+          : '';
+        const storedTgToken = String(sys?.tg_bot_token || '').trim();
+        const effectiveTgBotToken = isMaskedSecretValue(clientTgToken)
+          ? storedTgToken
+          : (clientTgToken || storedTgToken);
         if (webhookEnabled) {
           if (!effectiveWebhookUrl || String(effectiveWebhookUrl).trim().length === 0) {
             return createBadRequestResponse('notificationWebhookUrlRequired');

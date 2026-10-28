@@ -48,6 +48,52 @@ test('the mask is recognised from the value the server sent', () => {
   );
 });
 
+test('a masked token never makes the panel write an empty value back', () => {
+  // smtpTokenApplied=true makes syncSmtpToken skip its completeness guard
+  // and write buildSmtpToken(smtpConfig) unconditionally. With an empty form
+  // that is '', and the next save would clear the stored SMTP configuration.
+  // Both masked paths must therefore leave smtpTokenApplied false.
+  const setter = blockOf("if (value === 'smtp') {");
+  // The branch itself, not the condition above it: the "if" arm checks
+  // isMaskedToken too, but that arm is the real-token path.
+  const branchStart = setter.indexOf('} else if (isMaskedToken(props.settings.tg_bot_token)) {');
+  assert.notEqual(branchStart, -1, 'the masked channel branch was not found');
+  const maskedBranch = setter.slice(branchStart, setter.indexOf('} else {', branchStart));
+  assert.ok(
+    /smtpTokenApplied\.value = false/.test(maskedBranch),
+    'the masked channel branch must not set smtpTokenApplied to true'
+  );
+  assert.ok(
+    !/smtpTokenApplied\.value = true/.test(maskedBranch),
+    'the masked channel branch must not set smtpTokenApplied to true'
+  );
+
+  const watcher = blockOf("watch(() => props.settings.tg_bot_token");
+  assert.ok(
+    /smtpTokenApplied\.value = !isMaskedToken\(token\)/.test(watcher),
+    'the token watcher must derive smtpTokenApplied from whether the token is masked'
+  );
+});
+
+test('the save-time notification check uses the stored token, not the mask', () => {
+  const handler = readFileSync(
+    fileURLToPath(new URL('../src/handlers/admin.js', import.meta.url)),
+    'utf8'
+  );
+  const start = handler.indexOf('const clientTgToken = ');
+  const end = handler.indexOf('if (webhookEnabled) {', start);
+  assert.ok(start !== -1 && end > start, 'the effectiveTgBotToken computation was not found');
+  const block = handler.slice(start, end);
+  assert.ok(
+    /isMaskedSecretValue\(clientTgToken\)/.test(block),
+    'the save-time check must recognise a masked client value'
+  );
+  assert.ok(
+    /storedTgToken/.test(block),
+    'the save-time check must fall back to the stored token'
+  );
+});
+
 test('the server keeps the smtp: prefix in the masked Telegram token', () => {
   const settings = readFileSync(
     fileURLToPath(new URL('../src/utils/settings.js', import.meta.url)),
