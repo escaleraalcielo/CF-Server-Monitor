@@ -8,37 +8,54 @@ const notificationSource = readFileSync(
   'utf8'
 );
 
-test('the webhook URL only accepts http and https', () => {
+test('every outbound notification URL is scheme-checked in one place', () => {
+  // The check lives in fetchWithRetry, the helper all the HTTP channels
+  // go through. A per-channel check would drift: new channels would not
+  // get one, and the ones that had would drift apart.
   const block = notificationSource.slice(
-    notificationSource.indexOf('function buildWebhookUrl'),
-    notificationSource.indexOf('function buildWebhookBody')
+    notificationSource.indexOf('async function fetchWithRetry'),
+    notificationSource.indexOf('function stripMarkdown')
   );
-  assert.ok(block.length > 0, 'buildWebhookUrl not found');
+  assert.ok(block.length > 0, 'fetchWithRetry not found');
   assert.ok(
-    /url\.protocol !== 'http:' && url\.protocol !== 'https:'/.test(block),
-    'the webhook url must reject any other scheme'
+    /parsed\.protocol !== 'http:' && parsed\.protocol !== 'https:'/.test(block),
+    'fetchWithRetry must reject any scheme other than http/https'
   );
   assert.ok(
-    block.indexOf('url.protocol') < block.indexOf('return url.toString()'),
-    'the scheme check must happen before the url is returned'
+    block.indexOf('parsed.protocol') < block.indexOf('await fetch('),
+    'the scheme check must happen before the request is made'
   );
 });
 
-test('the OneBot endpoint only accepts http and https', () => {
-  const block = notificationSource.slice(
-    notificationSource.indexOf('onebot:http'),
-    notificationSource.indexOf('OneBot 通知发送失败')
-  );
-  assert.ok(block.length > 0, 'the OneBot block was not found');
-  assert.ok(
-    /endpointUrl\.protocol !== 'http:' && endpointUrl\.protocol !== 'https:'/.test(block),
-    'the OneBot url must reject any other scheme'
+test('no channel checks the scheme on its own any more', () => {
+  // Exactly one scheme check, in the shared helper.
+  const checks = [...notificationSource.matchAll(/protocol !== 'http:'/g)];
+  assert.equal(
+    checks.length, 1,
+    `expected one scheme check in fetchWithRetry, found ${checks.length}`
   );
 });
 
-test('the OneBot variable is spelled consistently', () => {
-  // A case mismatch here would be a ReferenceError at send time, and it
-  // would be swallowed by the try/catch into a generic failure message.
+test('the SMTP channel is not affected by the http/https check', () => {
+  // SMTP goes through the cloudflare-smtp package (cloudflare:sockets),
+  // not through fetchWithRetry - so the scheme check cannot break it.
+  assert.ok(
+    notificationSource.includes("await import('cloudflare-smtp')"),
+    'the SMTP channel must still use the cloudflare-smtp package'
+  );
+  const smtpBlock = notificationSource.slice(
+    notificationSource.indexOf('async function sendSmtpNotification'),
+    notificationSource.indexOf('export async function sendNotification')
+  );
+  assert.ok(
+    !smtpBlock.includes('fetchWithRetry('),
+    'the SMTP channel must not go through the http/https scheme check'
+  );
+});
+
+test('the OneBot url variable is spelled consistently', () => {
+  // A case mismatch would be a ReferenceError at send time, swallowed by
+  // the try/catch into a generic failure message.
   const declared = notificationSource.match(/let (one\w*[Uu]rl) =/);
   assert.ok(declared, 'the OneBot url variable declaration was not found');
   const uses = [...notificationSource.matchAll(/\b(one\w*[Uu]rl)\b/g)].map(m => m[1]);

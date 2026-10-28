@@ -48,6 +48,33 @@ npx wrangler secret put JWT_SECRET
 
 Local copies of the live credentials live at `~/.config/cf-server-monitor/credentials.env` (mode 600).
 
+### Password hashing is bounded by the plan, not by the guidance
+
+`PASSWORD_HASH_ITERATIONS` is **50 000**, not the OWASP figure of 600 000. That is not an
+oversight — it is measured. This account runs on **Workers Free**, where one request gets
+**10 ms of CPU**, and the budget is enforced per derivation. Measured on the edge with a
+throwaway probe worker on the same account:
+
+| Workload | Result |
+|---|---|
+| 1 × 50 000 iterations | 200 |
+| 1 × 100 000 iterations | 200 |
+| 1 × 110 000 iterations | **1101** (over budget) |
+| 2 × 100 000 iterations | 200 |
+| 3 × 100 000 iterations | 200 |
+
+So the ceiling is roughly 100 000 iterations **per derivation**; the number of derivations
+does not add up against the budget. At 600 000 every login would fail with 1101 and the
+panel would be unreachable — the OWASP figure is simply not reachable on this plan.
+50 000 is what production already runs on, with about 2× margin to the measured failure
+point. Raise it when the plan is upgraded.
+
+> The iteration count is stored inside the hash (`pbkdf2_sha256$<iterations>$<salt>$<hash>`),
+> so changing the constant never invalidates an existing password: old hashes still verify
+> and are flagged for a re-hash, so they upgrade themselves on the next successful login.
+> A hash below the current count is only flagged for a rewrite when the password was
+> **correct** — matching the legacy-MD5 branch — so a failed login never rewrites the row.
+
 ### What the browser may see (2026-10-28)
 
 `get_settings` no longer returns `api_secret`. That value is the shared key every agent

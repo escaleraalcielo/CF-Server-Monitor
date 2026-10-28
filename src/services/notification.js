@@ -454,6 +454,19 @@ async function evaluateResourceAlertRules(stub, ruleRequests) {
 }
 
 async function fetchWithRetry(url, options, retries = NOTIFICATION_MAX_RETRIES) {
+  // 通知目标的 URL 都是管理员自己填的，但没必要让 data:、file: 之类的
+  // scheme 走到 fetch。放在这里而不是每个渠道各写一份：新增渠道时
+  // 不会再漏掉，而且没有哪条路径能绕过。
+  // （SMTP 走的是 cloudflare-smtp 的 cloudflare:sockets，不经过这里。）
+  let parsed;
+  try {
+    parsed = new URL(String(url));
+  } catch (_) {
+    throw new Error('invalid notification url');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('unsupported notification url scheme');
+  }
   for (let i = 0; i < retries; i++) {
     try {
       const response = await fetch(url, options);
@@ -588,11 +601,6 @@ function buildWebhookUrl(settings, context, method) {
   if (!renderedUrl) throw new Error('missing webhook url');
 
   const url = new URL(renderedUrl);
-  // 只允许 http/https：Webhook 的目标是管理员自己填的，但没必要让
-  // data:、file: 之类的 scheme 走到 fetch 这一步。
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('unsupported webhook url scheme');
-  }
   if (method === 'GET') {
     for (const [key, value] of buildWebhookQueryParams(settings, context)) {
       if (!key) continue;
@@ -889,12 +897,6 @@ export async function sendNotification(settings, msg, notificationContext = {}) 
     }
     try {
       const endpoint = onebotUrl.trim();
-      // 同样只允许 http/https。OneBot 一般指向自建服务（可能是
-      // 127.0.0.1），所以这里不做地址白名单——目标本来就是管理员自己定的。
-      const endpointUrl = new URL(endpoint);
-      if (endpointUrl.protocol !== 'http:' && endpointUrl.protocol !== 'https:') {
-        throw new Error('unsupported onebot url scheme');
-      }
       const body = {
         [isGroup ? 'group_id' : 'user_id']: targetId,
         message: [

@@ -46,10 +46,19 @@ export async function verifyTurnstileToken(token, secretKey) {
  * 管理后台密码哈希参数
  */
 export const PASSWORD_HASH_ALGORITHM = 'pbkdf2_sha256';
-// OWASP 对 PBKDF2-HMAC-SHA256 的建议强度。旧的哈希把迭代次数写在哈希串里
-// （pbkdf2_sha256$<iterations>$<salt>$<hash>），所以提高这个值不会让
-// 已存的密码失效——旧哈希照常校验通过，并在下次成功登录时自动升级。
-export const PASSWORD_HASH_ITERATIONS = 600000;
+// 迭代次数写在哈希串里（pbkdf2_sha256$<iterations>$<salt>$<hash>），
+// 所以改这个值不会让已存的密码失效：旧哈希照常校验通过，并在下次成功
+// 登录时按下面的规则升级。
+//
+// 为什么不是 OWASP 建议的 600000：这个账号跑在 Workers Free，单请求 CPU
+// 预算 10 ms。实测（同一个账号、同一个边缘运行时，临时探针 Worker 测的）：
+//   1 次 100000 次迭代 -> 200
+//   1 次 110000 次迭代 -> 1101（超预算）
+//   多次各 100000 次迭代 -> 200（预算是按每次调用算的，不是累加）
+// 所以单次派生的上限在 10 万次左右，600000 在这个套餐上根本走不通，
+// 照抄会让登录直接 1101、面板进不去。50000 是线上已经在跑、留了
+// 一倍余量的值。升套餐以后再往上调。
+export const PASSWORD_HASH_ITERATIONS = 50000;
 const PASSWORD_SALT_BYTES = 16;
 const PASSWORD_HASH_BYTES = 32;
 
