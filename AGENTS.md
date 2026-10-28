@@ -482,3 +482,36 @@ One upstream test (`frontend-live-socket.test.js`) fails in this environment bec
 `vite-plugin-mkcert` needs an interactive `sudo` to install a CA — unrelated to any
 change in this clone. It fails identically on the base commit, so compare against the
 base before blaming a change.
+
+change in this clone.
+
+### The Durable Object's alert snapshot is throttled, and the throttle works
+
+`_persistResourceAlertSnapshotIfNeeded()` writes the whole `resource_alert_windows_v1` blob to
+storage. With no frontend subscriber — the normal state — it has to write more eagerly than the
+60 s interval, because the object hibernates between reports and would lose the in-memory
+samples. But "more eagerly" must not mean "on every report": that is a storage write on the
+message hot path, and it grows with the fleet.
+
+Two things keep it bounded:
+
+- the forced write uses a **10 s** minimum interval (`RESOURCE_ALERT_FORCE_SAVE_MIN_INTERVAL_MS`).
+  The sampling window is 60 s, so losing ten seconds of samples does not change an alert
+  verdict;
+- a write with **no samples to save is skipped** entirely.
+
+> The throttle used to be dead code. The constructor initialised
+> `resourceAlertLastSnapshotSave`, while the read and the write used
+> `resourceAlertSnapshotLastSave` — one word out of order. `now - undefined` is `NaN`, and
+> `NaN < interval` is always false, so **every** report rewrote the whole snapshot. Both
+> names now refer to the same field. `test/metrics-broadcaster-agent-config.test.js` pins it:
+> five reports with no subscriber must cause one write, not five.
+
+### A failed attachment write is loud, not silent
+
+A Durable Object WebSocket attachment is capped at 16 KB, and `serializeAttachment()` throws
+when it is exceeded. `_saveAgentPendingAggregate()` used to swallow that error, which lost the
+pending aggregate **and** the session state stored in the same attachment. It now logs the
+failure, retries without the aggregate so the session survives, and closes the socket if even
+that fails — a broken attachment makes the agent reconnect with a clean one.
+
