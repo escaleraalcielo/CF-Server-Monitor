@@ -439,19 +439,10 @@ export default {
           return response;
         }
 
-        if (setTurnstileVerified) {
-          const finalHeaders = new Headers(response.headers);
-          finalHeaders.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '');
-          finalHeaders.set('Access-Control-Allow-Credentials', 'true');
-          finalHeaders.set('Vary', 'Origin');
-
-          return new Response(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: finalHeaders
-          });
-        }
-
+        // 走 Turnstile 校验的请求和其它响应用同一套来源校验。
+        // 之前这里单独回显请求的 Origin 并带上 Access-Control-Allow-Credentials: true，
+        // 任何站点都能带着面板的 cfsm_auth Cookie 跨域读取这些响应；
+        // Turnstile 校验通过只说明这次请求来自真人，不代表来源站点可信。
         return applyCors(response, request, corsAllowedOrigins);
       }
     }

@@ -68,6 +68,22 @@ function hexToBytes(hex) {
   return bytes;
 }
 
+/**
+ * 常量时间比较两个字符串是否相等。
+ *
+ * 逐字符比较（===）会在第一个不同的字节处提前返回，攻击者可以通过响应时间
+ * 逐字节猜出共享密钥。这里先把两边都做一次 SHA-256 摘要，再对等长摘要做
+ * 常量时间比较：长度不同也不会提前返回，比较耗时不依赖密钥内容。
+ */
+export async function timingSafeEqualString(left, right) {
+  const encoder = new TextEncoder();
+  const [leftDigest, rightDigest] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(String(left ?? ''))),
+    crypto.subtle.digest('SHA-256', encoder.encode(String(right ?? '')))
+  ]);
+  return timingSafeEqualBytes(new Uint8Array(leftDigest), new Uint8Array(rightDigest));
+}
+
 function timingSafeEqualBytes(left, right) {
   if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array)) {
     return false;

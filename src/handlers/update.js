@@ -8,6 +8,7 @@ import {
   coerceNumericMetricFields
 } from '../utils/metrics.js';
 import { createErrorResponse, createUnauthorizedResponse, createBadRequestResponse } from '../utils/errors.js';
+import { timingSafeEqualString } from '../utils/common.js';
 import { ensureServerOptimization } from '../database/indexOptimization.js';
 import { getResourceAlertConfig, getWssReportScheduleState, isWssReportConfigured, loadSiteSettings, normalizeBooleanSetting } from '../utils/settings.js';
 import { cacheLatestReportUpdate } from '../utils/latestReportCache.js';
@@ -95,6 +96,48 @@ function getDeclaredContentLength(request) {
   if (!raw) return null;
   const length = Number(raw);
   return Number.isFinite(length) && length >= 0 ? length : null;
+}
+
+/**
+ * 按实际读取的字节数封顶读取请求体。
+ *
+ * Content-Length 只是发送方的声明：chunked 请求可以不带它，也可以写一个
+ * 更小的值。真正的上限必须建立在“读了多少字节”上，否则未认证的请求可以
+ * 用一个很小的 Content-Length 换来一次不受限的 body 解析。
+ *
+ * @returns {Promise<string|null>} 读取到的文本；超过上限时返回 null
+ */
+async function readBodyWithLimit(request, maxBytes) {
+  const body = request.body;
+  if (!body) return '';
+
+  const reader = body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        // 超限就中断读取，绝不把超限的 body 交给 JSON.parse。
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch (_) {
+    return null;
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
 }
 
 function createPayloadTooLargeResponse() {
@@ -592,7 +635,8 @@ export async function handleUpdate(request, env, ctx) {
 async function handleUpdateCore(request, env, ctx, discovery) {
   try {
     // 必须在 request.json() 之前：超大 body 的解析本身就可能耗尽 Worker CPU。
-    // 注意这是防呆而非硬上限：chunked 或缺少 Content-Length 的请求会跳过该检查。
+    // Content-Length 只是发送方的声明，所以真正的上限建立在“读了多少字节”上：
+    // chunked 请求可以不带它，也可以写一个更小的值。
     const declaredLength = getDeclaredContentLength(request);
     if (declaredLength !== null && declaredLength > UPDATE_MAX_REQUEST_BYTES) {
       console.warn('[Update] 413 Payload too large:', {
@@ -602,10 +646,22 @@ async function handleUpdateCore(request, env, ctx, discovery) {
       return createPayloadTooLargeResponse();
     }
 
-    const data = await request.json();
-    const { id: requestedId, secret } = data;
+    const rawBody = await readBodyWithLimit(request, UPDATE_MAX_REQUEST_BYTES);
+    if (rawBody === null) {
+      return createPayloadTooLargeResponse();
+    }
 
-    if (secret !== env.API_SECRET) {
+    let data;
+    try {
+      data = JSON.parse(rawBody);
+    } catch (_) {
+      return createBadRequestResponse('invalidJson');
+    }
+    const { id: requestedId, secret } = data || {};
+
+    // 逐字符比较会在第一个不同的字节处提前返回，攻击者可以用响应时间
+    // 逐字节猜出共享密钥。改成常量时间比较。
+    if (!await timingSafeEqualString(secret, env.API_SECRET)) {
       return createUnauthorizedResponse('Invalid secret');
     }
 
