@@ -1,7 +1,7 @@
 import { buildAuthCookie, buildClearAuthCookie, checkAuth, getAuthPayload, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
 import { getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, clearServersListCache } from '../utils/cache.js';
-import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
+import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, maskSecretValue, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SECRET_SETTING_FIELDS, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
 import { normalizePctOrNull } from '../utils/traffic.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
@@ -554,17 +554,39 @@ const PUBLIC_ADMIN_ACTION_HANDLERS = {
 
 export function sanitizeAdminSettings(fullSettings = {}) {
   const { jwt_secret, password, ...safeSettings } = fullSettings || {};
-  return {
+  const sanitized = {
     ...safeSettings,
     password_configured: Boolean(String(password || '').trim())
   };
+  // 凭据字段只回传掩码，并单独给出"是否已配置"标志，
+  // 前端据此显示为已配置状态而不是空。
+  for (const field of SECRET_SETTING_FIELDS) {
+    sanitized[field] = maskSecretValue(sanitized[field]);
+    sanitized[`${field}_configured`] = Boolean(String(fullSettings?.[field] || '').trim());
+  }
+  return sanitized;
 }
 
 async function handleGetSettingsAction({ env, sys, loadFullSettings }) {
   const fullSettings = loadFullSettings ? await loadFullSettings() : sys;
+  // 注意：这里不再返回 api_secret。它是所有 Agent 共用的上报密钥，
+  // 也写在每台被监控机器的 config.conf 里；把它放进常规设置响应
+  // 意味着任何能打开后台的浏览器（包括面板自身域上的 XSS）都能读到它。
+  // 需要安装命令时由 get_install_secret 按需单独下发。
   return createSuccessResponse({
     success: true,
-    settings: sanitizeAdminSettings(fullSettings),
+    settings: sanitizeAdminSettings(fullSettings)
+  });
+}
+
+// 仅在管理员显式打开"安装命令"面板时按需下发上报密钥，
+// 面板关闭后前端即丢弃，不进入常规设置状态。
+async function handleGetInstallSecretAction({ env }) {
+  if (!env.API_SECRET) {
+    return createBadRequestResponse('apiSecretNotConfigured');
+  }
+  return createSuccessResponse({
+    success: true,
     api_secret: env.API_SECRET
   });
 }
@@ -681,7 +703,11 @@ async function handleListAction({ env, data }) {
 async function handleD1UsageAction({ data, sys }) {
   const hasCloudflareToken = Object.prototype.hasOwnProperty.call(data, 'cloudflare_token');
   const hasCloudflareAccountId = Object.prototype.hasOwnProperty.call(data, 'cloudflare_account_id');
-  const cloudflareToken = hasCloudflareToken ? data.cloudflare_token : (sys?.cloudflare_token || '');
+  // 优先用库里存的那个 Cloudflare 令牌：前端拿到的是掩码，
+  // 用它去查 GraphQL 会直接失败。客户端传来的值只作为兜底。
+  const storedToken = String(sys?.cloudflare_token || '').trim();
+  const clientToken = String(data.cloudflare_token || '').trim();
+  const cloudflareToken = storedToken || (hasCloudflareToken ? clientToken : '');
   const cloudflareAccountId = hasCloudflareAccountId ? data.cloudflare_account_id : (sys?.cloudflare_account_id || '');
 
   try {
@@ -757,6 +783,7 @@ async function handleSendTestNotificationAction({ data }) {
 
 const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
   get_settings: handleGetSettingsAction,
+  get_install_secret: handleGetInstallSecretAction,
   start_theme_preview: handleStartThemePreviewAction,
   save_theme_options: handleSaveThemeOptionsAction,
   list: handleListAction,

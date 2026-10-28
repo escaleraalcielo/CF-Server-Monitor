@@ -1463,7 +1463,8 @@ const loadSettings = async () => {
       }
       applyMikusThemeOptions(settingsData.theme_options)
       changeAdminPassword.value = !settings.value.password_configured || !String(settings.value.username || '').trim()
-      apiSecret.value = data.api_secret || ''
+      // 上报密钥（api_secret）不再随设置一起下发；打开安装命令面板时按需获取。
+      apiSecret.value = ''
       // 只有已保存到服务端的自动发现开关才提供复制安装命令，避免复制出当前并未生效的命令
       savedAutoDiscovery.value = settings.value.auto_discovery
     }
@@ -1755,6 +1756,24 @@ const addServer = async () => {
   }
 }
 
+// 上报密钥按需获取：只有管理员打开安装命令面板时才向服务端要，
+// 面板关闭后立刻丢弃。常规设置响应里不再携带这个共享密钥。
+const fetchInstallSecret = async () => {
+  if (apiSecret.value) return apiSecret.value
+  try {
+    const result = await adminApiForSite({ action: 'get_install_secret' })
+    if (result.error) return ''
+    apiSecret.value = result.data?.api_secret || ''
+    return apiSecret.value
+  } catch (_) {
+    return ''
+  }
+}
+
+const clearInstallSecret = () => {
+  apiSecret.value = ''
+}
+
 const getInstallCommand = (serverId) => {
   const HOST = selectedApiBase.value
   return `curl -sL ${HOST}/install.sh | bash -s install -id=${serverId} -secret='${apiSecret.value}' -url=${HOST}/update`
@@ -1836,6 +1855,8 @@ const copyCmd = (serverId) => {
   autoUpdate.value = server?.auto_update === '1' || server?.auto_update === 1 || server?.auto_update === true
   copiedCmd.value = false
   showCopyModal.value = true
+  // 安装命令里带上报密钥，打开面板时按需取一次。
+  fetchInstallSecret()
 }
 
 const buildGhRawUrl = (proxy, path) => {
@@ -2015,10 +2036,13 @@ const openAutoDiscoveryModal = () => {
 
   autoDiscoveryCopied.value = false
   showAutoDiscoveryModal.value = true
+  // 安装命令里带上报密钥，打开面板时按需取一次。
+  fetchInstallSecret()
 }
 
 const closeAutoDiscoveryModal = () => {
   showAutoDiscoveryModal.value = false
+  clearInstallSecret()
 }
 
 const copyAutoDiscoveryCmd = async () => {
@@ -2050,6 +2074,7 @@ const copyCustomCmd = async () => {
 
 const closeCopyModal = () => {
   showCopyModal.value = false
+  clearInstallSecret()
 }
 
 const openEditModalFromCopy = () => {
@@ -2560,8 +2585,8 @@ const queryD1Usage = async () => {
   try {
     const result = await adminApiForSite({
       action: 'd1_usage',
-      cloudflare_account_id: settings.value.cloudflare_account_id,
-      cloudflare_token: settings.value.cloudflare_token
+      cloudflare_account_id: settings.value.cloudflare_account_id
+      // cloudflare_token 不再回传：前端只有掩码，服务端用自己的库中副本。
     })
     if (!result.error) {
       d1UsageResult.value = result.data
