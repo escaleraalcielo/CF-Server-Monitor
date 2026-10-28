@@ -11,6 +11,11 @@ import {
 } from '../utils/latestReportCache.js';
 import { markFrontendRealtimeActive } from '../utils/realtimeBroadcastGate.js';
 import {
+  normalizePublicIpFields,
+  toPublicServer,
+  toPublicLatestReportUpdates
+} from '../utils/publicPayload.js';
+import {
   DASHBOARD_LATENCY_WINDOW_HOURS,
   DASHBOARD_LATENCY_WINDOW_POINTS,
   DASHBOARD_LATEST_REPORT_ID_CHUNK_SIZE
@@ -35,26 +40,8 @@ function createEmptyLatencyWindow() {
   return { ping: [], loss: [] };
 }
 
-function toPublicIpReachability(value) {
-  const normalized = String(value ?? '').trim().toLowerCase();
-  return normalized && normalized !== '0' && normalized !== 'false' ? '1' : '0';
-}
-
-function normalizePublicIpFields(item, ensureFields = true) {
-  if (ensureFields || Object.prototype.hasOwnProperty.call(item, 'ip_v4')) {
-    item.ip_v4 = toPublicIpReachability(item.ip_v4);
-  }
-  if (ensureFields || Object.prototype.hasOwnProperty.call(item, 'ip_v6')) {
-    item.ip_v6 = toPublicIpReachability(item.ip_v6);
-  }
-  for (const field of ['data', 'payload', 'metrics']) {
-    if (item[field] && typeof item[field] === 'object' && !Array.isArray(item[field])) {
-      item[field] = normalizePublicIpFields({ ...item[field] }, false);
-    }
-  }
-  return item;
-}
-
+// 登录会话保持既有响应形状：删除历史上一直删除的三个字段，
+// 并把 IP 归一成可达性标志。未登录访客走 publicPayload 的白名单构建。
 function withoutPrivateServerFields(server) {
   const item = { ...server };
   delete item.bandwidth;
@@ -199,12 +186,17 @@ export async function handleServerAPI(request, env, sys) {
     getRealtimeStateForServers(env, [id])
   ]);
   mergeMetricsIntoServer(server, latestMetrics);
-  server.latestReportUpdates = realtimeState.latestReportUpdates;
-  server.sysConfig = {
+  
+  // 未登录访客只能拿到白名单视图；登录会话保持既有响应形状。
+  const view = isLoggedIn ? withoutPrivateServerFields(server) : toPublicServer(server);
+  view.latestReportUpdates = isLoggedIn
+    ? realtimeState.latestReportUpdates
+    : toPublicLatestReportUpdates(realtimeState.latestReportUpdates);
+  view.sysConfig = {
     long_history_points: Number(normalizeLongHistoryPoints(sys.long_history_points))
   };
   
-  return createSuccessResponse(omitNullLossProbeFields(withoutPrivateServerFields(server)));
+  return createSuccessResponse(omitNullLossProbeFields(view));
 }
 
 export async function handleServersAPI(request, env, sys) {
@@ -215,7 +207,7 @@ export async function handleServersAPI(request, env, sys) {
   }
   markFrontendRealtimeActive();
   
-  const results = (await getAllServers(env.DB, isLoggedIn)).map(withoutPrivateServerFields);
+  const results = await getAllServers(env.DB, isLoggedIn);
   const shouldIncludeLatencyHistory = sys.show_three_net_details === 'true';
   
   const serverIds = results.map(server => server.id).filter(Boolean);
@@ -242,7 +234,6 @@ export async function handleServersAPI(request, env, sys) {
       isOnline = (now - latestMetrics.timestamp) < 300000;
       mergeMetricsIntoServer(server, latestMetrics);
     }
-    normalizePublicIpFields(server);
     
     if (isOnline) {
       globalOnline++;
@@ -261,9 +252,17 @@ export async function handleServersAPI(request, env, sys) {
   
   const globalOffline = results.length - globalOnline;
 
+  // 未登录访客只能拿到白名单视图；登录会话保持既有响应形状。
+  const servers = isLoggedIn
+    ? results.map(withoutPrivateServerFields)
+    : results.map(toPublicServer);
+  const latestReportUpdates = isLoggedIn
+    ? realtimeState.latestReportUpdates
+    : toPublicLatestReportUpdates(realtimeState.latestReportUpdates);
+
   const data = {
-    servers: results,
-    latestReportUpdates: realtimeState.latestReportUpdates,
+    servers,
+    latestReportUpdates,
     stats: {
       total: results.length,
       online: globalOnline,
