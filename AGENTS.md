@@ -78,6 +78,32 @@ Two things worth keeping straight:
 > A hash below the current count is only flagged for a rewrite when the password was
 > **correct** — matching the legacy-MD5 branch — so a failed login never rewrites the row.
 
+### Where heavy work belongs: the DO has 30 s, a Worker request has ~1 s
+
+Measured on this account (Workers Free) on 2026-10-28 with a throwaway probe worker, burning
+CPU in repeated 100 000-iteration PBKDF2 derivations (13 ms of accounted CPU each) and reading
+Cloudflare's own `cpuTime`/`outcome` from `wrangler tail`:
+
+| Path | Effective CPU ceiling | Reported at failure |
+|---|---|---|
+| Worker request (stateless) | ~1 s — 624 ms survived, ~1 s+ killed | `exceededCpu`, cpuTime 126–2058 ms |
+| Durable Object invocation | **30 s** | `exceededCpu`, cpuTime exactly **30000 ms** |
+
+The Free plan *documents* 10 ms of CPU per Worker request, and the runtime enforces it with far
+more tolerance than that — a Worker request survived 624 ms of real CPU here. But that is
+**not** the same budget as a Durable Object's, which is enforced exactly at 30 s. So:
+
+- Anything that has to burn more than a few ms of CPU belongs in the **Durable Object**, not
+  in the Worker request path.
+- The 30 s is the DO class's `limits.cpu_ms` default, not a plan allowance — it is the same on
+  Free and Paid.
+
+The current split already respects this: the per-minute cron and the `/update` handler stay in
+the Worker and measure **6.5 ms average / 39 ms max**, while the metric fan-out to WebSocket
+subscribers runs in `MetricsBroadcaster` (**6.1 ms average / 14 ms max**). Both sit far below
+the ceiling that actually bites, which is why the panel has run two days with zero errors
+despite exceeding the documented 10 ms on its tail.
+
 ### What the browser may see (2026-10-28)
 
 `get_settings` no longer returns `api_secret`. That value is the shared key every agent
