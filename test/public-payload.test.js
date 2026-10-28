@@ -356,7 +356,8 @@ test('the authenticated admin responses keep the private fields', async () => {
   assert.equal(adminServer.expire_date, MARKER);
   assert.equal(adminServer.connection_mode, MARKER);
 
-  // 仪表盘接口的登录会话保留既有后台可见字段（白名单只作用于未登录请求）。
+  // 仪表盘接口的登录会话保留既有响应形状（白名单只作用于未登录请求）：
+  // tags/custom_* 等字段保留，历史上一直删除的 note/bandwidth/auto_update 仍不出现。
   const authedList = await (await handleServersAPI(
     await authedRequest(env, 'https://example.com/api/servers'),
     env,
@@ -366,6 +367,11 @@ test('the authenticated admin responses keep the private fields', async () => {
   assert.equal(authedServer.price, MARKER);
   assert.equal(authedServer.expire_date, MARKER);
   assert.equal(authedServer.connection_mode, MARKER);
+  assert.equal(authedServer.tags, `tier-one,${MARKER}`);
+  assert.equal(authedServer.custom_ct, MARKER);
+  assert.ok(!('note' in authedServer));
+  assert.ok(!('bandwidth' in authedServer));
+  assert.ok(!('auto_update' in authedServer));
 
   const authedDetail = await (await handleServerAPI(
     await authedRequest(env, `https://example.com/api/server?id=${PUBLIC_ID}`),
@@ -375,6 +381,11 @@ test('the authenticated admin responses keep the private fields', async () => {
   assert.equal(authedDetail.price, MARKER);
   assert.equal(authedDetail.expire_date, MARKER);
   assert.equal(authedDetail.connection_mode, MARKER);
+  assert.equal(authedDetail.tags, `tier-one,${MARKER}`);
+  assert.equal(authedDetail.custom_ct, MARKER);
+  assert.ok(!('note' in authedDetail));
+  assert.ok(!('bandwidth' in authedDetail));
+  assert.ok(!('auto_update' in authedDetail));
 });
 
 test('public realtime updates drop the server id; admin updates keep it', async () => {
