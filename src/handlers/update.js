@@ -42,6 +42,10 @@ import {
   authenticateAgentCredential
 } from '../utils/agentTokens.js';
 import {
+  markTrafficBaselineApplied,
+  reconcileServerTrafficBaseline
+} from '../utils/trafficBaseline.js';
+import {
   UPDATE_FRONTEND_SUBSCRIBER_CHECK_INTERVAL_MS,
   UPDATE_MAX_BATCH_SAMPLES,
   UPDATE_MAX_REQUEST_BYTES,
@@ -540,6 +544,7 @@ function _ensureBatchFlush(env) {
           if (resolve) resolve();
         });
       }, UPDATE_REALTIME_BATCH_WINDOW_MS);
+      if (typeof flushTimer?.unref === 'function') flushTimer.unref();
     }
     return flushingPromise;
   }
@@ -558,6 +563,7 @@ function _ensureBatchFlush(env) {
         if (currentResolve) currentResolve();
       });
     }, normalizedDelayMs);
+    if (typeof flushTimer?.unref === 'function') flushTimer.unref();
   }));
 
   return flushingPromise;
@@ -778,10 +784,14 @@ async function handleUpdateCore(request, env, ctx, discovery) {
       return createBadRequestResponse('Missing metrics');
     }
 
+    await reconcileServerTrafficBaseline(env.DB, serverDetail, samples, data, {
+      patchCache: (serverId, value) => patchServerDetailCache(serverId, { traffic_baseline: value })
+    });
+
     // 获取最后一条插入（如果是批量数据，取最后一个样本）
     const latestSample = samples[samples.length - 1];
-    const latestMetrics = getReportMetrics(data, latestSample);
-    const historyMetrics = getHistoryMetrics(data, samples, latestSample);
+    const latestMetrics = markTrafficBaselineApplied(getReportMetrics(data, latestSample));
+    const historyMetrics = markTrafficBaselineApplied(getHistoryMetrics(data, samples, latestSample));
     await saveMetricsHistory(
       env.DB,
       id,
